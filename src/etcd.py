@@ -1,7 +1,10 @@
 import abc
 import base64
+import hashlib
+import ipaddress
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 
 import httpx
@@ -16,6 +19,8 @@ ETCD_ADDRESS = "%s://%s:%d" % (ETCD_SCHEME, ETCD_HOST, ETCD_PORT)
 STATUS_TIMEOUT = 3
 
 from typing import Generic, TypeVar
+
+from .server import address_from_server
 
 
 @dataclass
@@ -85,7 +90,7 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
         pass
 
     @abc.abstractmethod
-    async def put(self, data: _EtcdData):
+    async def put(self, data: _EtcdData) -> None:
         """
         Put new data into etcd
         """
@@ -94,6 +99,12 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
     async def get(self) -> _EtcdData:
         """
         Get etcd data
+        """
+
+    @abc.abstractmethod
+    async def delete(self) -> None:
+        """
+        Delete etcd data
         """
 
     async def watch(self):
@@ -134,6 +145,15 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
                         except Exception as e:
                             logger.exception(e)
 
+    @property
+    def relation_hash(self) -> str:
+        tnb: bytes = "%d".encode("utf-8") % (time.time_ns())
+        _hash: str = hashlib.md5(tnb).hexdigest()
+        return _hash[:10]
+
+    def base64_str(self, value: bytes) -> str:
+        return base64.b64encode(value).decode("utf-8")
+
 
 from .server import Server, State, _Server
 
@@ -147,6 +167,18 @@ class MySQLEtcdNotFoundNode(ValueError):
     pass
 
 
+class MySQLEtcdDuplicateNode(ValueError):
+    pass
+
+
+class JSONEncoderForMySQLEtcd(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            return str(o)
+        else:
+            return super().defualt(o)
+
+
 class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
     KEYNAME: bytes = b"/core/mysql"
 
@@ -155,15 +187,21 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
 
     async def put(self, data: MySQLEtcdData) -> None:
         _ddata = asdict(data)
-        _jdata: str = json.dumps(_ddata)
+        _jdata: str = json.dumps(_ddata, cls=JSONEncoderForMySQLEtcd)
         async with httpx.AsyncClient() as client:
+            _api: str = self._address + "/v3/kv/put"
+            _hash: str = self.relation_hash
+            logger.debug("[%s] Put data about MySQL into etcd via %s" % (_hash, _api))
             response = await client.post(
-                self._address + "/v3/kv/put",
+                _api,
                 timeout=10,
                 json={
-                    "key": base64.b64encode(self.KEYNAME).decode("utf-8"),
-                    "value": base64.b64encode(_jdata.encode("utf-8")).decode("utf-8"),
+                    "key": self.base64_str(self.KEYNAME),
+                    "value": self.base64_str(_jdata.encode("utf-8")),
                 },
+            )
+            logger.debug(
+                "[%s] Response status code %d for put" % (_hash, response.status_code)
             )
             if not response.is_success:
                 raise EtcdHttpResponseError(
@@ -173,12 +211,18 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
 
     async def get(self) -> MySQLEtcdData:
         async with httpx.AsyncClient() as client:
+            _api: str = self._address + "/v3/kv/range"
+            _hash: str = self.relation_hash
+            logger.debug("[%s] Get data about MySQL from etcd via %s" % (_hash, _api))
             response = await client.post(
-                self._address + "/v3/kv/range",
+                _api,
                 timeout=10,
                 json={
-                    "key": base64.b64encode(self.KEYNAME).decode("utf-8"),
+                    "key": self.base64_str(self.KEYNAME),
                 },
+            )
+            logger.debug(
+                "[%s] Response status code %d for get" % (_hash, response.status_code)
             )
             if not response.is_success:
                 raise EtcdHttpResponseError(
@@ -189,6 +233,10 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
             jdata = response.json()
             _kvs = jdata.get("kvs")
             if _kvs is None:
+                logger.info(
+                    "[%s] Not found MySQL etcd data (key: %s)"
+                    % (_hash, self.KEYNAME.decode("utf-8"))
+                )
                 return MySQLEtcdData(
                     nodes=[],
                 )
@@ -202,6 +250,8 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
             dacite_config = Config(
                 type_hooks={
                     State: State,
+                    ipaddress.IPv4Address: ipaddress.ip_address,
+                    ipaddress.IPv6Address: ipaddress.ip_address,
                 },
             )
             etcd_data: MySQLEtcdData = from_dict(
@@ -211,15 +261,93 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
             )
             return etcd_data
 
+    async def delete(self) -> None:
+        async with httpx.AsyncClient() as client:
+            _api: str = self._address + "/v3/kv/deleterange"
+            _hash: str = self.relation_hash
+            logger.debug(
+                "[%s] Delete data about MySQL from etcd via %s" % (_hash, _api)
+            )
+            response = await client.post(
+                _api,
+                timeout=10,
+                json={
+                    "key": self.base64_str(self.KEYNAME),
+                    "range_end": self.base64_str(b"0"),
+                },
+            )
+            logger.debug(
+                "[%s] Response status code %d for delete"
+                % (_hash, response.status_code)
+            )
+            if not response.is_success:
+                raise EtcdHttpResponseError(
+                    status_code=response.status_code,
+                    body=response.content,
+                )
+
     async def update_state(self, server: _Server, state: State) -> None:
         data: MySQLEtcdData = await self.get()
 
         for node in data.nodes:
             if node.host == server.host and node.port == server.port:
+                _addr: str = "%s:%d" % (server.host, server.port)
+                logger.debug(
+                    'Update node state of %s from "%s" to "%s"'
+                    % (_addr, node.state, state)
+                )
                 # Update new state
                 node.state = state
                 break
         else:
             raise MySQLEtcdNotFoundNode
 
+        await self.put(data)
+
+    async def add_new_node(
+        self, server: _Server, init_state: State = State.Unknown
+    ) -> None:
+        data: MySQLEtcdData = await self.get()
+        if (
+            len(
+                list(
+                    filter(
+                        lambda x: x.host == server.host and x.port == server.port,
+                        data.nodes,
+                    )
+                )
+            )
+            > 0
+        ):
+            raise MySQLEtcdDuplicateNode(
+                "Already have %s" % (address_from_server(server))
+            )
+        data.nodes.append(
+            Server(
+                host=server.host,
+                port=server.port,
+                state=init_state,
+            )
+        )
+        await self.put(data)
+
+    async def delete_node(self, server: _Server) -> None:
+        data: MySQLEtcdData = await self.get()
+
+        _n: list[Server] = list(
+            filter(
+                lambda x: x.host == server.host and x.port == server.port,
+                data.nodes,
+            )
+        )
+        if len(_n) == 0:
+            raise MySQLEtcdNotFoundNode("Not found %s" % (address_from_server(server)))
+
+        new_nodes: list[Server] = list(
+            filter(
+                lambda x: not (x.host == server.host and x.port == server.port),
+                data.nodes,
+            )
+        )
+        data.nodes = new_nodes
         await self.put(data)

@@ -54,6 +54,25 @@ class ServerPool:
             ),
         )
 
+    def _state(self, state: State) -> list[Server]:
+        return self._state_map[state]
+
+    @property
+    def run(self) -> list[Server]:
+        return self._state(State.Run)
+
+    @property
+    def move(self) -> list[Server]:
+        return self._state(State.Move)
+
+    @property
+    def broken(self) -> list[Server]:
+        return self._state(State.Broken)
+
+    @property
+    def unknown(self) -> list[Server]:
+        return self._state(State.Unknown)
+
 
 class MySQLServerPool(ServerPool):
     def __init__(

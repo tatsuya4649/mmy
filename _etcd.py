@@ -1,7 +1,9 @@
 import asyncio
+import ipaddress
 
 from src.etcd import MySQLEtcdClient, MySQLEtcdData
-from src.server import Server, State
+from src.log import init_log
+from src.server import State, _Server
 
 etcd = MySQLEtcdClient()
 
@@ -16,18 +18,20 @@ async def get():
 
 
 async def main():
-    data: MySQLEtcdData = await get()
     from random import choice, randint
 
     _r = lambda: randint(0, 255)
-    ns = Server(
-        host=f"{_r()}.{_r()}.{_r()}.{_r()}",
+    _s = list(State)
+    _state = choice(_s)
+    ns = _Server(
+        host=ipaddress.ip_address(f"{_r()}.{_r()}.{_r()}.{_r()}"),
         port=randint(100, 10000),
-        state=choice(list(State)),
     )
-    data.nodes.append(ns)
-
-    await etcd.put(data)
+    await etcd.add_new_node(ns, State.Unknown)
 
 
+#    await etcd.delete()
+
+
+init_log()
 asyncio.run(main())
