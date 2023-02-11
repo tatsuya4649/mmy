@@ -7,7 +7,7 @@ from typing import NewType
 from loguru import logger
 from uhashring import HashRing
 
-from .server import _Server
+from .server import _Server, address_from_server
 
 _Point = NewType("_Point", int)
 
@@ -62,14 +62,33 @@ class RingHandler(ABC):
         """
 
 
+@dataclass
+class MDP(MoveData):
+    start: _Point
+    end: _Point
+
+
 class Ring(RingHandler):
     def __init__(
         self,
+        init_nodes: list[Node] = list(),
         default_vnodes: int = 80,
     ):
-        self._hr = HashRing()
-        self._node_hash: dict[str, Node] = dict()
         self._default_vnodes = default_vnodes
+        nodes = dict()
+        for _in in init_nodes:
+            nodes[self.nodename_from_node(_in)] = {
+                "instance": _in,
+                "vnodes": self._default_vnodes,
+            }
+        self._hr = HashRing(
+            nodes=nodes,
+        )
+        self._node_hash: dict[str, Node] = dict()
+        self._from_to: list[MDP] | None = None
+
+    def nodename_from_node(self, node: Node) -> str:
+        return str(node.host)
 
     def logring(self):
         DELIMITER_COUNT = 50
@@ -92,7 +111,7 @@ class Ring(RingHandler):
 
     async def add(self, node: Node):
         points: list[tuple[int, str]] = self._hr.get_points()
-        _nodename: str = node.host
+        _nodename: str = self.nodename_from_node(node)
         keys: list[int] = self._hr._keys
         keys.sort()
 
@@ -109,19 +128,18 @@ class Ring(RingHandler):
             logger.info(f"Add first node {node.host}:{node.port} as {_nodename} ")
             return
 
-        items: list[int] = list()
+        added_items: list[int] = list()
         added_points: list[tuple[int, str]] = self._hr.get_points()
         added_keys: list[int] = self._hr._keys
         added_keys.sort()
 
         for item, nodename in added_points:
             if _nodename == nodename:
-                items.append(item)
+                added_items.append(item)
 
         def get_add_point() -> Point:
             _index = added_keys.index(item)
-            point, nodename = added_points[_index]
-            node: Node = self._hr[nodename]
+            point, _ = added_points[_index]
             return Point(
                 have_node=node,
                 point=_Point(point),
@@ -155,7 +173,8 @@ class Ring(RingHandler):
             return pp
 
         logger.info(f"Add node {node.host}:{node.port} as {_nodename} ")
-        for item in items:
+        self._from_to = list()
+        for item in added_items:
             p = get_add_point()
             np = get_next_point()
             pp = get_prev_point()
@@ -168,12 +187,19 @@ class Ring(RingHandler):
                 node=p.have_node,
                 point=p.point,
             )
-            await self._move(_from, _to, pp.point, p.point)
+            mdp: MDP = MDP(
+                _from=_from,
+                _to=_to,
+                start=pp.point,
+                end=p.point,
+            )
+            self._from_to.append(mdp)
+            await self._move(mdp)
 
     async def delete(self, node: Node):
         points: list[tuple[int, str]] = self._hr.get_points()
         items = list()
-        _nodename: str = node.host
+        _nodename: str = self.nodename_from_node(node)
         for item, nodename in points:
             if _nodename == nodename:
                 items.append(item)
@@ -191,8 +217,7 @@ class Ring(RingHandler):
 
         def get_delete_point() -> Point:
             _index = keys.index(item)
-            point, nodename = points[_index]
-            node: Node = _prev_hr[nodename]
+            point, _ = points[_index]
             return Point(
                 have_node=node,
                 point=_Point(point),
@@ -239,9 +264,20 @@ class Ring(RingHandler):
                 node=np.have_node,
                 point=p.point,
             )
-            await self._move(_from, _to, pp.point, p.point)
 
-    async def _move(self, _from: Md, _to: Md, start: _Point, end: _Point):
+            mdp: MDP = MDP(
+                _from=_from,
+                _to=_to,
+                start=pp.point,
+                end=p.point,
+            )
+            await self._move(mdp)
+
+    async def _move(self, mdp: MDP):
+        _from: Md = mdp._from
+        _to: Md = mdp._to
+        start: _Point = mdp.start
+        end: _Point = mdp.end
         if _from.node.host == _to.node.host:
             logger.info("From node and To node is same")
             return
@@ -249,8 +285,8 @@ class Ring(RingHandler):
         _from_address: str = "%s:%d" % (_from.node.host, _from.node.port)
         _to_address: str = "%s:%d" % (_to.node.host, _to.node.port)
         logger.info(f"Move data: {_from_address} ==> {_to_address} ")
-        logger.info(f"\tStart: {start}")
-        logger.info(f"\tEnd:   {end}")
+        logger.info(f"  Start: {start}")
+        logger.info(f"  End:   {end}")
         await self.move(
             MoveData(
                 _from=_from,
@@ -258,12 +294,21 @@ class Ring(RingHandler):
             )
         )
 
+    @property
+    def from_to_data(self) -> list[MDP]:
+        if self._from_to is None:
+            raise RuntimeError("No data moved yet")
+        return self._from_to
+
 
 class MySQLRing(Ring):
     def __init__(
         self,
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(
+            **kwargs,
+        )
 
     async def move(self, data: MoveData):
         logger.info("Move MySQL data")
@@ -271,4 +316,47 @@ class MySQLRing(Ring):
         import asyncio
 
         await asyncio.sleep(0.1)
-        self.logring()
+
+    async def delete_from_old_nodes(self, new_node: Node):
+        _ftd: list[MDP] = self.from_to_data
+
+        for item in _ftd:
+            from_node = item._from.node
+            to_node = item._to.node
+            if from_node == new_node:
+                raise RuntimeError(
+                    f"From node({address_from_server(from_node)}) must not be new node({address_from_server(new_node)})"
+                )
+            if not (to_node == new_node):
+                raise RuntimeError(
+                    f"To node({address_from_server(to_node)}) must be new node({address_from_server(new_node)})"
+                )
+
+            logger.info(f"Old data delete from {address_from_server(from_node)}")
+            logger.info(f"  Start: {item.start}")
+            logger.info(f"  End:   {item.end}")
+            # TODO: delete from old MySQL node
+            import asyncio
+
+            await asyncio.sleep(0.1)
+        return
+
+    async def optimize_table_old_nodes(self, new_node: Node):
+        _ftd: list[MDP] = self.from_to_data
+        _from_nodes: list[Node] = list()
+        for item in _ftd:
+            from_node = item._from.node
+            if from_node not in _from_nodes:
+                _from_nodes.append(from_node)
+
+        for from_node in _from_nodes:
+            if from_node == new_node:
+                raise RuntimeError(
+                    f"From node({address_from_server(from_node)}) must not be new node({address_from_server(new_node)})"
+                )
+
+            # TODO: delete from old MySQL node
+            import asyncio
+
+            await asyncio.sleep(0.1)
+            logger.info(f"Optimize MySQL node: {address_from_server(from_node)}")

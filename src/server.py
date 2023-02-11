@@ -24,3 +24,15 @@ class Server(_Server):
 def address_from_server(_s: _Server) -> str:
     addr = "%s:%d" % (str(_s.host), _s.port)
     return addr
+
+
+def state_rich_str(state: State) -> str:
+    match state:
+        case State.Run:
+            return f"[bold turquoise2]{state.value}[/bold turquoise2]"
+        case State.Move:
+            return f"[bold chartreuse3]{state.value}[/bold chartreuse3]"
+        case State.Broken:
+            return f"[bold red]{state.value}[/bold red]"
+        case State.Unknown:
+            return f"[bold white]{state.value}[/bold white]"

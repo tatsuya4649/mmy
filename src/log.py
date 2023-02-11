@@ -1,4 +1,5 @@
 from loguru import logger
+from rich.logging import RichHandler
 
 
 def init_log():

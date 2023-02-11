@@ -1,5 +1,6 @@
 import abc
 import base64
+import copy
 import hashlib
 import ipaddress
 import json
@@ -306,8 +307,9 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
 
     async def add_new_node(
         self, server: _Server, init_state: State = State.Unknown
-    ) -> None:
+    ) -> tuple[MySQLEtcdData, MySQLEtcdData]:
         data: MySQLEtcdData = await self.get()
+        old_data: MySQLEtcdData = copy.deepcopy(data)
         if (
             len(
                 list(
@@ -330,6 +332,7 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
             )
         )
         await self.put(data)
+        return data, old_data
 
     async def delete_node(self, server: _Server) -> None:
         data: MySQLEtcdData = await self.get()
