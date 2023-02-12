@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 from cmd import Cmd
+from typing import Coroutine
 
 import click
 from loguru import logger
@@ -139,9 +140,10 @@ async def _add_main(server: _Server):
             host=server.host,
             port=server.port,
         )
-        await _ring.add(
+        move: Coroutine[None, None, None] = await _ring.add(
             node=node,
         )
+        await move
         logger.info("Inserted MySQL data from existed node into new node")
         logger.info("Update state of new MySQL node on etcd")
         await etcd.update_state(
@@ -152,6 +154,7 @@ async def _add_main(server: _Server):
         await notification_app_via_api(
             _type=APIType.Update,
         )
+
         # TODO: Delete unnecessary data from moved node
         logger.info(
             "Delete unnecessary data(non owner of hashed) from existed MySQL node"

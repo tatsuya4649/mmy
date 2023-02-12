@@ -2,11 +2,12 @@ import bisect
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NewType
+from typing import Coroutine, NewType
 
 from loguru import logger
 from uhashring import HashRing
 
+from .mysql import MySQLClient
 from .server import _Server, address_from_server
 
 _Point = NewType("_Point", int)
@@ -109,7 +110,10 @@ class Ring(RingHandler):
         logger.info(DELIMITER)
         pass
 
-    async def add(self, node: Node):
+    async def add(self, node: Node) -> Coroutine[None, None, None]:
+        async def _emp():
+            return
+
         points: list[tuple[int, str]] = self._hr.get_points()
         _nodename: str = self.nodename_from_node(node)
         keys: list[int] = self._hr._keys
@@ -126,7 +130,8 @@ class Ring(RingHandler):
         self._node_hash[_nodename] = node
         if len(points) == 0:
             logger.info(f"Add first node {node.host}:{node.port} as {_nodename} ")
-            return
+
+            return _emp()
 
         added_items: list[int] = list()
         added_points: list[tuple[int, str]] = self._hr.get_points()
@@ -194,7 +199,9 @@ class Ring(RingHandler):
                 end=p.point,
             )
             self._from_to.append(mdp)
-            await self._move(mdp)
+            return self._move(mdp)
+
+        return _emp()
 
     async def delete(self, node: Node):
         points: list[tuple[int, str]] = self._hr.get_points()
@@ -313,6 +320,9 @@ class MySQLRing(Ring):
     async def move(self, data: MoveData):
         logger.info("Move MySQL data")
         # TODO: move data
+        _from: Md = data._from
+        _to: Md = data._to
+
         import asyncio
 
         await asyncio.sleep(0.1)

@@ -4,16 +4,7 @@ services:
     build: .
     ports: [ "12379:12379", "12380:12380" ]
     command: >-
-      /usr/local/bin/etcd
-      -name etcd1
-      -data-dir /etcd-data
-      -listen-client-urls http://0.0.0.0:12379
-      -advertise-client-urls http://0.0.0.0:12379
-      -listen-peer-urls http://172.16.0.4:12380
-      -initial-advertise-peer-urls http://172.16.0.4:12380
-      -initial-cluster etcd1=http://172.16.0.4:12380,etcd2=http://172.16.0.5:12382
-      -initial-cluster-token tkn
-      -initial-cluster-state new
+      /usr/local/bin/etcd -name etcd1 -data-dir /etcd-data -listen-client-urls http://0.0.0.0:12379 -advertise-client-urls http://0.0.0.0:12379 -listen-peer-urls http://172.16.0.4:12380 -initial-advertise-peer-urls http://172.16.0.4:12380 -initial-cluster etcd1=http://172.16.0.4:12380,etcd2=http://172.16.0.5:12382 -initial-cluster-token tkn -initial-cluster-state new
     networks:
       etcd-network:
         ipv4_address: 172.16.0.4
@@ -21,19 +12,36 @@ services:
     build: .
     ports: [ "12381:12381", "12382:12382" ]
     command: >-
-      /usr/local/bin/etcd
-      -name etcd2
-      -data-dir /etcd-data
-      -listen-client-urls http://0.0.0.0:12381
-      -advertise-client-urls http://0.0.0.0:12381
-      -listen-peer-urls http://172.16.0.5:12382
-      -initial-advertise-peer-urls http://172.16.0.5:12382
-      -initial-cluster etcd1=http://172.16.0.4:12380,etcd2=http://172.16.0.5:12382
-      -initial-cluster-token tkn
-      -initial-cluster-state new
+      /usr/local/bin/etcd -name etcd2 -data-dir /etcd-data -listen-client-urls http://0.0.0.0:12381 -advertise-client-urls http://0.0.0.0:12381 -listen-peer-urls http://172.16.0.5:12382 -initial-advertise-peer-urls http://172.16.0.5:12382 -initial-cluster etcd1=http://172.16.0.4:12380,etcd2=http://172.16.0.5:12382 -initial-cluster-token tkn -initial-cluster-state new
     networks:
       etcd-network:
         ipv4_address: 172.16.0.5
+
+  mysql1:
+    container_name: "mmysql1"
+    image: mysql:8.0.32
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: docker
+      MYSQL_PASSWORD: docker
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+    ports:
+      - 10001:3306
+
+  mysql2:
+    container_name: "mmysql2"
+    image: mysql:8.0.32
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: docker
+      MYSQL_PASSWORD: docker
+    ports:
+      - 10002:3306
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
 
 networks:
   etcd-network:
