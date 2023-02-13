@@ -10,10 +10,13 @@ from python_on_whales import docker
 from rich import print
 from src.mysql import (
     INSERT_ONCE_LIMIT,
+    MySQLAuthInfo,
+    MySQLAuthInfoByTable,
     MySQLClient,
     MySQLClientTooManyInsertAtOnce,
     MySQLColumns,
     MySQLKeys,
+    TableName,
     _Extra,
 )
 
@@ -38,6 +41,21 @@ class DockerMySQL(Enum):
     )
 
 
+TEST_TABLE1: str = "user"
+TEST_TABLE2: str = "post"
+ROOT: MySQLAuthInfo = MySQLAuthInfo(
+    user="root",
+    password="root",
+)
+DOCKER_AUTH_MYSQL: MySQLAuthInfoByTable = MySQLAuthInfoByTable(
+    default=ROOT,
+    by_tables={
+        TEST_TABLE1: ROOT,
+        TEST_TABLE2: ROOT,
+    },
+)
+
+
 class TMySQLClient(MySQLClient):
     GENERATE_RANDOM_DATA_REPEAT_COUNT: int = 10
     GENERATE_RANDOM_DATA_MIN_COUNT: int = 10000
@@ -46,8 +64,6 @@ class TMySQLClient(MySQLClient):
         self,
         host="127.0.0.1",
         port=10001,
-        user="root",
-        password="root",
         db="test",
         connect_timeout=3,
         **kwargs,
@@ -55,15 +71,14 @@ class TMySQLClient(MySQLClient):
         super().__init__(
             host=host,
             port=port,
-            user=user,
-            password=password,
+            auth=DOCKER_AUTH_MYSQL,
             db=db,
             connect_timeout=connect_timeout,
             **kwargs,
         )
 
-    async def _generate_random(self, call: str, *args):
-        async with self._connect as connect:
+    async def _generate_random(self, table: TableName, call: str, *args):
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 sargs = list(map(lambda x: str(x), args))
@@ -73,6 +88,7 @@ class TMySQLClient(MySQLClient):
 
     async def generate_random_user(self):
         await self._generate_random(
+            TEST_TABLE1,
             "generate_random_user",
             self.GENERATE_RANDOM_DATA_REPEAT_COUNT,
             self.GENERATE_RANDOM_DATA_MIN_COUNT,
@@ -80,6 +96,7 @@ class TMySQLClient(MySQLClient):
 
     async def generate_random_post(self):
         await self._generate_random(
+            TEST_TABLE2,
             "generate_random_post",
             self.GENERATE_RANDOM_DATA_REPEAT_COUNT,
             self.GENERATE_RANDOM_DATA_MIN_COUNT,
@@ -146,9 +163,6 @@ async def insert_random_data():
     cli = TMySQLClient()
     await cli.generate_random_post()
     await cli.generate_random_user()
-
-
-TEST_TABLE1: str = "user"
 
 
 @pytest.mark.asyncio

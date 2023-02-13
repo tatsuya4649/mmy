@@ -1,5 +1,6 @@
 import bisect
 import copy
+import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Coroutine, NewType
@@ -7,10 +8,16 @@ from typing import Coroutine, NewType
 from loguru import logger
 from uhashring import HashRing
 
-from .mysql import MySQLClient
+from .mysql.client import (
+    MySQLAuthInfoByTable,
+    MySQLClient,
+    MySQLColumns,
+    MySQLFetchAll,
+    TableName,
+)
 from .server import _Server, address_from_server
 
-_Point = NewType("_Point", int)
+_Point = NewType("_Point", str)
 
 
 @dataclass
@@ -84,6 +91,7 @@ class Ring(RingHandler):
             }
         self._hr = HashRing(
             nodes=nodes,
+            hash_fn=lambda key: hashlib.md5(str(key).encode("utf-8")).hexdigest(),
         )
         self._node_hash: dict[str, Node] = dict()
         self._from_to: list[MDP] | None = None
@@ -114,9 +122,9 @@ class Ring(RingHandler):
         async def _emp():
             return
 
-        points: list[tuple[int, str]] = self._hr.get_points()
+        points: list[tuple[str, str]] = self._hr.get_points()
         _nodename: str = self.nodename_from_node(node)
-        keys: list[int] = self._hr._keys
+        keys: list[str] = self._hr._keys
         keys.sort()
 
         _prev_hr = copy.deepcopy(self._hr)
@@ -133,9 +141,9 @@ class Ring(RingHandler):
 
             return _emp()
 
-        added_items: list[int] = list()
-        added_points: list[tuple[int, str]] = self._hr.get_points()
-        added_keys: list[int] = self._hr._keys
+        added_items: list[str] = list()
+        added_points: list[tuple[str, str]] = self._hr.get_points()
+        added_keys: list[str] = self._hr._keys
         added_keys.sort()
 
         for item, nodename in added_points:
@@ -204,7 +212,7 @@ class Ring(RingHandler):
         return _emp()
 
     async def delete(self, node: Node):
-        points: list[tuple[int, str]] = self._hr.get_points()
+        points: list[tuple[str, str]] = self._hr.get_points()
         items = list()
         _nodename: str = self.nodename_from_node(node)
         for item, nodename in points:
@@ -218,8 +226,8 @@ class Ring(RingHandler):
         del self._node_hash[_nodename]
         self._hr.remove_node(node)
 
-        deleted_points: list[tuple[int, str]] = self._hr.get_points()
-        deleted_keys: list[int] = self._hr._keys
+        deleted_points: list[tuple[str, str]] = self._hr.get_points()
+        deleted_keys: list[str] = self._hr._keys
         deleted_keys.sort()
 
         def get_delete_point() -> Point:
@@ -308,24 +316,70 @@ class Ring(RingHandler):
         return self._from_to
 
 
-class MySQLRing(Ring):
+class MySQLMetaRing:
+    RING_VNODES: int = 80
+
+    def nodename_from_node(self, node: Node) -> str:
+        return str(node.host)
+
+
+class MySQLRing(
+    Ring,
+    MySQLMetaRing,
+):
     def __init__(
         self,
+        db: str,
+        auth: MySQLAuthInfoByTable,
         **kwargs,
     ):
         super().__init__(
             **kwargs,
         )
+        self._db = db
+        self._auth = auth
+
+    def table_names(self):
+        return list(self._auth.by_tables.keys())
 
     async def move(self, data: MoveData):
         logger.info("Move MySQL data")
-        # TODO: move data
         _from: Md = data._from
         _to: Md = data._to
 
-        import asyncio
-
-        await asyncio.sleep(0.1)
+        _from_client = MySQLClient(
+            db=self._db,
+            host=_from.node.host,
+            port=_from.node.port,
+            auth=self._auth,
+        )
+        _to_client = MySQLClient(
+            db=self._db,
+            host=_to.node.host,
+            port=_to.node.port,
+            auth=self._auth,
+        )
+        await _from_client.ping()
+        await _to_client.ping()
+        for table in self.table_names():
+            tablename: TableName = TableName(table)
+            _from_data = await _from_client.consistent_hashing_select(
+                table=tablename,
+                start=str(_from.point),
+                end=str(_to.point),
+            )
+            columns: list[MySQLColumns] = await _from_client.columns_info(tablename)
+            excluded_columns: list[
+                MySQLColumns
+            ] = _from_client.exclude_auto_increment_columns(columns)
+            async for frag in _from_data:
+                modified_frag: MySQLFetchAll = _from_client.exclude_data_by_columns(
+                    excluded_columns, frag
+                )
+                await _to_client.insert(
+                    table=tablename,
+                    datas=modified_frag,
+                )
 
     async def delete_from_old_nodes(self, new_node: Node):
         _ftd: list[MDP] = self.from_to_data
@@ -345,10 +399,19 @@ class MySQLRing(Ring):
             logger.info(f"Old data delete from {address_from_server(from_node)}")
             logger.info(f"  Start: {item.start}")
             logger.info(f"  End:   {item.end}")
-            # TODO: delete from old MySQL node
-            import asyncio
+            _from_client = MySQLClient(
+                db=self._db,
+                host=from_node.host,
+                port=from_node.port,
+                auth=self._auth,
+            )
+            for table in self.table_names():
+                await _from_client.consistent_hashing_delete(
+                    table=table,
+                    start=item.start,
+                    end=item.end,
+                )
 
-            await asyncio.sleep(0.1)
         return
 
     async def optimize_table_old_nodes(self, new_node: Node):
@@ -365,8 +428,11 @@ class MySQLRing(Ring):
                     f"From node({address_from_server(from_node)}) must not be new node({address_from_server(new_node)})"
                 )
 
-            # TODO: delete from old MySQL node
-            import asyncio
-
-            await asyncio.sleep(0.1)
+            _from_client = MySQLClient(
+                db=self._db,
+                host=from_node.host,
+                port=from_node.port,
+                auth=self._auth,
+            )
+            await _from_client.optimize_table()
             logger.info(f"Optimize MySQL node: {address_from_server(from_node)}")

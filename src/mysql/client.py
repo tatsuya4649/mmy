@@ -4,13 +4,22 @@ import ipaddress
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal, Type, TypeVar
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Literal,
+    NewType,
+    Type,
+    TypeAlias,
+    TypeVar,
+)
 
 import aiomysql
 from aiomysql.cursors import DictCursor
 from dacite import Config, from_dict
 from loguru import logger
-from rich import print
 
 
 class _AbcGetAsyncIter(abc.ABC):
@@ -28,6 +37,10 @@ class _AbcGetAsyncIter(abc.ABC):
 
 
 GetAsyncIter = TypeVar("GetAsyncIter", bound=_AbcGetAsyncIter)
+
+
+MySQLFetchOne: TypeAlias = dict[str, Any]
+MySQLFetchAll: TypeAlias = list[MySQLFetchOne]
 
 
 class YesNo(Enum):
@@ -155,6 +168,22 @@ class MySQLClientTooManyInsertAtOnce(ValueError):
     pass
 
 
+@dataclass
+class MySQLAuthInfo:
+    user: str
+    password: str
+
+
+TableName = NewType("TableName", str)
+_MySQLAuthInfoByTable: TypeAlias = dict[TableName, MySQLAuthInfo]
+
+
+@dataclass
+class MySQLAuthInfoByTable:
+    default: MySQLAuthInfo
+    by_tables: _MySQLAuthInfoByTable
+
+
 class MySQLClient:
     IDENTIFY_PRIMARY: str = "PRIMARY"
 
@@ -162,26 +191,35 @@ class MySQLClient:
         self,
         host: ipaddress.IPv4Address | ipaddress.IPv6Address,
         port: int,
-        user: str,
-        password: str,
+        auth: MySQLAuthInfoByTable,
         db: str,
         connect_timeout: int = CONNECT_TIMEOUT,
     ):
         self._host = host
         self._port = port
-        self._user = user
-        self._password = password
         self._db = db
+        self._auth = auth
         self._connect_timeout = connect_timeout
-        pass
 
-    @property
-    def _connect(self):
+    def _default_connect(self):
         return aiomysql.connect(
             host=str(self._host),
             port=self._port,
-            user=self._user,
-            password=self._password,
+            user=self._auth.default.user,
+            password=self._auth.default.password,
+            db=self._db,
+            cursorclass=DictCursor,
+            charset="utf8mb4",
+            connect_timeout=self._connect_timeout,
+            autocommit=False,
+        )
+
+    def _connect(self, table: TableName):
+        return aiomysql.connect(
+            host=str(self._host),
+            port=self._port,
+            user=self._auth.by_tables[table].user,
+            password=self._auth.by_tables[table].password,
             db=self._db,
             cursorclass=DictCursor,
             charset="utf8mb4",
@@ -191,9 +229,9 @@ class MySQLClient:
 
     async def get_table_rows(
         self,
-        table: str,
+        table: TableName,
     ) -> int:
-        async with self._connect as connect:
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 await cursor.execute(
@@ -206,16 +244,16 @@ class MySQLClient:
 
     async def insert(
         self,
-        table: str,
+        table: TableName,
         datas: list[dict[str, Any]],
-    ):
+    ) -> None:
         if len(datas) == 0:
             return
         if len(datas) > INSERT_ONCE_LIMIT:
             raise MySQLClientTooManyInsertAtOnce
 
         first_item = datas[0]
-        async with self._connect as connect:
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 columns: str = ", ".join(first_item.keys())
@@ -229,11 +267,11 @@ class MySQLClient:
 
     async def select(
         self,
-        table: str,
+        table: TableName,
         limit_once: int = 10000,
         iter_type: Type[GetAsyncIter] | None = None,
-    ):
-        async with self._connect as connect:
+    ) -> AsyncGenerator[list[dict[str, Any]], None]:
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 _nclass: Type[_AbcGetAsyncIter] = _GetAsyncIter
@@ -249,11 +287,11 @@ class MySQLClient:
 
     async def consistent_hashing_select(
         self,
-        table: str,
+        table: TableName,
         start: str,
         end: str,
         limit_once: int = 10000,
-    ):
+    ) -> AsyncGenerator[list[dict[str, Any]], None]:
         keys: list[MySQLKeys] = await self.primary_keys_info(table)
 
         class CHSIter(_AbcGetAsyncIter):
@@ -333,7 +371,7 @@ class MySQLClient:
 
     async def consistent_hashing_delete(
         self,
-        table: str,
+        table: TableName,
         start: str,
         end: str,
     ):
@@ -341,7 +379,7 @@ class MySQLClient:
         primary_key: MySQLKeys = keys[0]
         primary_keyname: str = primary_key.Column_name
         _hash_fn: str = "MD5"
-        async with self._connect as connect:
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 logger.debug(
@@ -401,8 +439,8 @@ class MySQLClient:
 
     async def map_per_row(
         self,
-        table: str,
-        fn: Callable[[list[dict[str, Any]]], None | Awaitable[None]],
+        table: TableName,
+        fn: Callable[[MySQLFetchAll], None | Awaitable[None]],
         limit_once: int = 10000,
     ) -> None:
         import inspect
@@ -424,8 +462,23 @@ class MySQLClient:
 
         return columns
 
-    async def columns_info(self, table: str) -> list[MySQLColumns]:
-        async with self._connect as connect:
+    def exclude_data_by_columns(
+        self,
+        columns: list[MySQLColumns],
+        datas: MySQLFetchAll,
+    ):
+        _c: list[str] = [i.Field for i in columns]
+
+        def _check_key(x: dict[str, Any]) -> dict[str, Any]:
+            for key in x.keys():
+                if key not in _c:
+                    x.pop(key)
+            return x
+
+        return list(map(_check_key, datas))
+
+    async def columns_info(self, table: TableName) -> list[MySQLColumns]:
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 await cursor.execute(f"SHOW COLUMNS FROM {table}")
@@ -450,9 +503,9 @@ class MySQLClient:
 
     async def primary_keys_info(
         self,
-        table: str,
+        table: TableName,
     ) -> list[MySQLKeys]:
-        async with self._connect as connect:
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 await cursor.execute(f'SHOW KEYS FROM {table} WHERE Key_name="PRIMARY"')
@@ -477,8 +530,8 @@ class MySQLClient:
                 return keys
 
     @log_elapsed_time("Optimize table")
-    async def optimize_table(self, table: str):
-        async with self._connect as connect:
+    async def optimize_table(self, table: TableName):
+        async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 await cursor.execute(f"OPTIMIZE TABLE {table}")
@@ -486,7 +539,7 @@ class MySQLClient:
 
     @log_elapsed_time("Ping")
     async def ping(self):
-        async with self._connect as connect:
+        async with self._default_connect() as connect:
             await asyncio.wait_for(
                 connect.ping(reconnect=False),
                 timeout=1,

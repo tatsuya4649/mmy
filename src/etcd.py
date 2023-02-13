@@ -7,6 +7,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass
+from typing import Any, AsyncGenerator, TypeAlias
 
 import httpx
 from dacite import Config, from_dict
@@ -50,6 +51,9 @@ class EtcdHttpResponseError(EtcdError):
     pass
 
 
+EtcdJson: TypeAlias = dict[str, Any]
+
+
 class EtcdClient(abc.ABC, Generic[_EtcdData]):
     def __init__(
         self,
@@ -78,7 +82,7 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
             logger.debug("PING %s" % (self._address))
             logger.info(resp.json())
 
-    def _parse_kv(self, kv: dict[str, str]):
+    def _parse_kv(self, kv: dict[str, str]) -> EtcdJson:
         _value: str | None = kv.get("value")
         if _value is None:
             logger.error("Unknown etcd format")
@@ -88,7 +92,7 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
         _vbytes: bytes = base64.b64decode(_bytes)
         jdict = json.loads(_vbytes)
         logger.info("Received value: %s" % jdict)
-        pass
+        return jdict
 
     @abc.abstractmethod
     async def put(self, data: _EtcdData) -> None:
@@ -108,10 +112,10 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
         Delete etcd data
         """
 
-    async def watch(self):
+    async def watch(self, key: bytes) -> AsyncGenerator[Any, None]:
         async with httpx.AsyncClient() as client:
             await self.ping()
-            key = base64.b64encode(b"foo")
+            key = base64.b64encode(key)
             logger.debug("Watching... %s" % (self._address))
             async with client.stream(
                 "POST",
@@ -142,7 +146,7 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
                         logger.info(event)
                         kv = event.get("kv")
                         try:
-                            self._parse_kv(kv)
+                            yield self._parse_kv(kv)
                         except Exception as e:
                             logger.exception(e)
 
@@ -183,8 +187,8 @@ class JSONEncoderForMySQLEtcd(json.JSONEncoder):
 class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
     KEYNAME: bytes = b"/core/mysql"
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
     async def put(self, data: MySQLEtcdData) -> None:
         _ddata = asdict(data)
@@ -209,6 +213,21 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
                     status_code=response.status_code,
                     body=response.content,
                 )
+
+    def _from_etcd_data(self, value: EtcdJson) -> MySQLEtcdData:
+        dacite_config = Config(
+            type_hooks={
+                State: State,
+                ipaddress.IPv4Address: ipaddress.ip_address,
+                ipaddress.IPv6Address: ipaddress.ip_address,
+            },
+        )
+        etcd_data: MySQLEtcdData = from_dict(
+            data_class=MySQLEtcdData,
+            data=value,
+            config=dacite_config,
+        )
+        return etcd_data
 
     async def get(self) -> MySQLEtcdData:
         async with httpx.AsyncClient() as client:
@@ -245,22 +264,8 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
                 raise RuntimeError
 
             _kv = _kvs[0]
-            # Value must be JSON format
-            _value = _kv["value"]
-            value = json.loads(base64.b64decode(_value))
-            dacite_config = Config(
-                type_hooks={
-                    State: State,
-                    ipaddress.IPv4Address: ipaddress.ip_address,
-                    ipaddress.IPv6Address: ipaddress.ip_address,
-                },
-            )
-            etcd_data: MySQLEtcdData = from_dict(
-                data_class=MySQLEtcdData,
-                data=value,
-                config=dacite_config,
-            )
-            return etcd_data
+            value = self._parse_kv(_kv)
+            return self._from_etcd_data(value)
 
     async def delete(self) -> None:
         async with httpx.AsyncClient() as client:
@@ -354,3 +359,8 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
         )
         data.nodes = new_nodes
         await self.put(data)
+
+    async def watch_mysql(self) -> AsyncGenerator[MySQLEtcdData, None]:
+        _w = super().watch(key=self.KEYNAME)
+        async for value in _w:
+            yield self._from_etcd_data(value)
