@@ -1,5 +1,5 @@
 import asyncio
-import pprint
+import socketserver
 import struct
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -148,8 +148,9 @@ class MySQLPacket:
 
 @dataclass
 class MySQLPacketWithDirection:
-    direction: MySQLProxyDirection
-    packet: MySQLPacket
+    direction: MySQLProxyDirection | None
+    packet: MySQLPacket | None
+    exception: Exception | None = None
 
 
 class EOF(ValueError):
@@ -320,10 +321,10 @@ class MySQLProxyContext:
         reader: asyncio.StreamReader,
         direction: MySQLProxyDirection,
     ) -> MySQLPacket:
-
         logger.debug("Waiting for receiving data")
         _header: bytes = await reader.read(4)
         if reader.at_eof():
+            logger.debug(f"EOF in {__file__}")
             raise EOF
 
         logger.debug("Received header data(4bytes)")
@@ -388,9 +389,9 @@ class MySQLProxyContext:
                 logger.debug(
                     "call[%d]: %s (line %d)" % (i, f.f_code.co_name, f.f_lineno)
                 )
-            logger.debug("-" * 66)
         except ValueError:
             pass
+        logger.debug("-" * 66)
         dump_data = [data[i : i + 16] for i in range(0, min(len(data), 256), 16)]
         for d in dump_data:
             logger.debug(
@@ -400,6 +401,7 @@ class MySQLProxyContext:
                 + "".join(printable(x) for x in d)
             )
         logger.debug("-" * 66)
+        return
 
     async def _after_receive(
         self,
@@ -497,40 +499,56 @@ class MySQLProxyContext:
                 packet=packet,
             )
 
+        async def _resource_release(pending):
+            for p in pending:
+                try:
+                    p.cancel()
+                    await p
+                except asyncio.CancelledError as e:
+                    logger.debug("Cancel pending task")
+
+        ctos = asyncio.create_task(_ctos())
+        stoc = asyncio.create_task(_stoc())
         done, pending = await asyncio.wait(
-            [
-                _ctos(),
-                _stoc(),
-            ],
+            [ctos, stoc],
             return_when=asyncio.FIRST_COMPLETED,
         )
-        for p in pending:
-            try:
-                p.cancel()
-            except asyncio.CancelledError as e:
-                logger.debug(e)
+        await _resource_release(pending)
 
         packets: list[MySQLPacketWithDirection] = list()
         for d in done:
-            result: MySQLPacketWithDirection = d.result()
-            packets.append(result)
-            direction: MySQLProxyDirection = result.direction
-            packet: MySQLPacket = result.packet
-            packet = await self._after_receive(packet=packet, fn=fn)
-            if direction is MySQLProxyDirection.CtoS:
-                await self.send_package(
-                    writer=self.server_writer,
-                    packet=packet,
-                )
-            else:
-                await self.send_package(
-                    writer=self._client_writer,
-                    packet=packet,
-                )
+            try:
+                result: MySQLPacketWithDirection = d.result()
+                packets.append(result)
 
-            logger.debug(
-                f"Send packet to {'server' if direction is MySQLProxyDirection.CtoS else 'client'}"
-            )
+                if result.direction is None or result.packet is None:
+                    raise ValueError
+
+                direction: MySQLProxyDirection = result.direction
+                packet: MySQLPacket = result.packet
+                packet = await self._after_receive(packet=packet, fn=fn)
+                if direction is MySQLProxyDirection.CtoS:
+                    await self.send_package(
+                        writer=self.server_writer,
+                        packet=packet,
+                    )
+                else:
+                    await self.send_package(
+                        writer=self._client_writer,
+                        packet=packet,
+                    )
+
+                logger.debug(
+                    f"Send packet to {'server' if direction is MySQLProxyDirection.CtoS else 'client'}"
+                )
+            except EOF:
+                packets.append(
+                    MySQLPacketWithDirection(
+                        direction=None,
+                        packet=None,
+                        exception=EOF(),
+                    )
+                )
 
         return packets
 
@@ -1027,6 +1045,11 @@ class MySQLProxyContext:
                             fn=None,
                         )
                         for pd in pds:
+                            if pd.exception is not None:
+                                raise pd.exception
+                            if pd.packet is None or pd.direction is None:
+                                raise ValueError
+
                             packet = pd.packet
                             if self.is_ok_packet(packet):
                                 self.update_connection_phase(MySQLConnectionPhase.OK)
@@ -1061,68 +1084,25 @@ class MySQLProxyContext:
 
     async def command_phase(
         self,
-        command_request_timeout: int,
-        command_response_timeout: int,
+        command_timeout: int,
     ) -> None:
         self.update_phase(MySQLConnectionLifecycle.Command)
         logger.debug("========== Command Phase =============")
         self.update_direction(MySQLProxyDirection.CtoS)
         try:
             while True:
-                request_packet: MySQLPacket = await asyncio.wait_for(
-                    self.from_client_to_server(fn=None),
-                    timeout=command_request_timeout,
-                )
-                self.update_direction(MySQLProxyDirection.StoC)
-                if request_packet.command_type is MySQLCommandType.COM_QUIT:
-                    logger.debug("Received COM_QUIT from client. Close connection.")
-                    break
-
-                response_packet = await asyncio.wait_for(
-                    self.from_server_to_client(
+                pds: list[MySQLPacketWithDirection] = await asyncio.wait_for(
+                    self.only_deliver(
                         fn=None,
                     ),
-                    timeout=command_response_timeout,
+                    timeout=command_timeout,
                 )
-                if request_packet.command_type is MySQLCommandType.COM_QUERY:
-                    if self.is_local_infile_packet(response_packet):
-                        self.update_direction(MySQLProxyDirection.CtoS)
-                        logger.debug("Received LOCAL INFILE Request")
-                        local_infile_packet: MySQLPacket = (
-                            await self.from_client_to_server(fn=None)
-                        )
-                        while not local_infile_packet.empty_packet:
-                            local_infile_packet = await self.from_client_to_server(
-                                fn=None
-                            )
+                for pd in pds:
+                    if pd.exception is not None:
+                        raise pd.exception
 
-                        self.update_direction(MySQLProxyDirection.StoC)
-                        # Maybe OK packet
-                        await self.from_server_to_client(fn=None)
-                        self.update_direction(MySQLProxyDirection.CtoS)
-                        continue
-
-                    _query_phase: MySQLQueryPhase = MySQLQueryPhase.Metadata
-                    self.update_direction(MySQLProxyDirection.StoC)
-                    while True:
-                        if self.is_ok_packet(response_packet):
-                            logger.debug("Received OK_Packet from MySQL server")
-                            if _query_phase is MySQLQueryPhase.Metadata:
-                                _query_phase = MySQLQueryPhase.Rows
-                                logger.debug(f"Update COM_QUERY phase: {_query_phase}")
-                            elif _query_phase is MySQLQueryPhase.Rows:
-                                logger.debug(f"End COM_QUERY")
-                                break
-
-                        if self.is_error_packet(response_packet):
-                            logger.debug("Received ERR_Packet from MySQL server")
-
-                        response_packet = await self.from_server_to_client(
-                            fn=None,
-                        )
-
-                self.update_direction(MySQLProxyDirection.CtoS)
-                continue
+                    if pd.packet is None or pd.direction is None:
+                        raise ValueError
         except asyncio.TimeoutError:
             if self._direction is MySQLProxyDirection.CtoS:
                 error_packet = ErrorPacket(
@@ -1146,10 +1126,14 @@ class MySQLProxyContext:
         if self._client_reader.at_eof():
             raise EOF
 
-        _header: bytes = await asyncio.wait_for(
-            self._client_reader.read(KEY_DATA_HEADER_LENGTH),
-            timeout=KEY_DATA_TIMEOUT,
-        )
+        try:
+            _header: bytes = await asyncio.wait_for(
+                self._client_reader.readexactly(KEY_DATA_HEADER_LENGTH),
+                timeout=KEY_DATA_TIMEOUT,
+            )
+        except asyncio.IncompleteReadError:
+            raise EOF
+
         if len(_header) != KEY_DATA_HEADER_LENGTH:
             raise ValueError(
                 f"Header length must be {KEY_DATA_HEADER_LENGTH}bytes but received now {len(_header)}."
@@ -1227,10 +1211,12 @@ class MySQLProxyContext:
         return self._key_data
 
     async def release(self):
-        self.server_writer.close()
-        await self.server_writer.wait_closed()
-        self._client_writer.close()
-        await self._client_writer.wait_closed()
+        if self._server_writer is not None and not self.server_writer.is_closing:
+            self.server_writer.close()
+            await self.server_writer.wait_closed()
+        if not self._client_writer.is_closing:
+            self._client_writer.close()
+            await self._client_writer.wait_closed()
 
 
 async def _proxy_handler(
@@ -1238,8 +1224,7 @@ async def _proxy_handler(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     connection_timeout: int,
-    command_request_timeout: int,
-    command_response_timeout: int,
+    command_timeout: int,
 ):
     logger.debug(f"Proxy handler")
     try:
@@ -1277,20 +1262,35 @@ async def _proxy_handler(
             )
 
             await ctx.command_phase(
-                command_request_timeout=command_request_timeout,
-                command_response_timeout=command_response_timeout,
+                command_timeout=command_timeout,
             )
         except asyncio.TimeoutError:
             logger.debug("Timeout error in KeyData")
             return
 
         logger.debug("End proxy handler")
-    except MySQLForceShutdownConnection:
-        logger.debug("Force shutdown connection")
     except EOF:
         logger.debug("Detect EOF")
+    except MySQLForceShutdownConnection:
+        logger.debug("Force shutdown connection")
     finally:
         await ctx.release()
+
+
+async def proxy_handler(
+    mysql_hosts: MySQLHosts,
+    client_reader: asyncio.StreamReader,
+    client_writer: asyncio.StreamWriter,
+    connection_timeout: int,
+    command_timeout: int,
+):
+    await _proxy_handler(
+        mysql_hosts=mysql_hosts,
+        client_reader=client_reader,
+        client_writer=client_writer,
+        connection_timeout=connection_timeout,
+        command_timeout=command_timeout,
+    )
 
 
 async def run_proxy_server(
@@ -1298,17 +1298,15 @@ async def run_proxy_server(
     host: str,
     port: int,
     connection_timeout: int,
-    command_request_timeout: int,
-    command_response_timeout: int,
+    command_timeout: int,
 ):
     server = await asyncio.start_server(
-        lambda r, w: _proxy_handler(
+        lambda r, w: proxy_handler(
             mysql_hosts=mysql_hosts,
             client_reader=r,
             client_writer=w,
             connection_timeout=connection_timeout,
-            command_request_timeout=command_request_timeout,
-            command_response_timeout=command_response_timeout,
+            command_timeout=command_timeout,
         ),
         host,
         port,

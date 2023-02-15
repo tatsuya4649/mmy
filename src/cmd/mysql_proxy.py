@@ -71,16 +71,10 @@ async def check_mysql(etcd: _Server):
     help="Timeout of MySQL connection phase",
 )
 @click.option(
-    "--command-request-timeout",
+    "--command-timeout",
     default=10,
     type=int,
     help="Timeout of MySQL command request from client to server",
-)
-@click.option(
-    "--command-response-timeout",
-    default=10,
-    type=int,
-    help="Timeout of MySQL command response from server to client",
 )
 def _main(
     host: str,
@@ -88,8 +82,7 @@ def _main(
     etcd_host: str,
     etcd_port: int,
     connection_timeout: int,
-    command_request_timeout: int,
-    command_response_timeout: int,
+    command_timeout: int,
 ):
     print("\n")
     print("Hello, this is [bold]mmysql[/bold].")
@@ -121,8 +114,7 @@ def _main(
                 host=host,
                 port=port,
                 connection_timeout=connection_timeout,
-                command_request_timeout=command_request_timeout,
-                command_response_timeout=command_response_timeout,
+                command_timeout=command_timeout,
             ),
             etcd_management(
                 mysql_hosts=mysql_hosts,

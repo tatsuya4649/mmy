@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from python_on_whales import docker
 from rich import print
 from src.mysql.hosts import MySQLHosts
-from src.mysql.proxy import run_proxy_server
+from src.mysql.proxy import proxy_handler
 from src.mysql.proxy_connection import ProxyConnection, proxy_connect
 
 from .test_mysql import DockerMySQL, container
@@ -24,16 +24,23 @@ PROXY_SERVER_STARTUP_TIMEOUT: int = 10
 
 @pytest.fixture()
 def proxy_server_start(event_loop: asyncio.AbstractEventLoop, unused_tcp_port: int):
-    proxy_server = event_loop.create_task(
-        run_proxy_server(
-            mysql_hosts=_MYSQL_HOSTS,
-            host=HOST,
-            port=unused_tcp_port,
-            connection_timeout=1,
-            command_request_timeout=1,
-            command_response_timeout=1,
+    async def _run_proxy_server():
+        _server = asyncio.start_server(
+            lambda r, w: proxy_handler(
+                mysql_hosts=_MYSQL_HOSTS,
+                client_reader=r,
+                client_writer=w,
+                connection_timeout=1,
+                command_timeout=1,
+            ),
+            HOST,
+            unused_tcp_port,
         )
-    )
+        _s = await _server
+        async with _s:
+            await _s.serve_forever()
+
+    proxy_server = event_loop.create_task(_run_proxy_server())
     # Waiting for start up server
     async def _ping_proxy_server():
         while True:
@@ -43,7 +50,7 @@ def proxy_server_start(event_loop: asyncio.AbstractEventLoop, unused_tcp_port: i
                 await writer.wait_closed()
                 return
             except ConnectionRefusedError:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
 
     async def _timeout_ping():
@@ -59,6 +66,7 @@ def proxy_server_start(event_loop: asyncio.AbstractEventLoop, unused_tcp_port: i
         proxy_server.cancel()
         with pytest.raises(asyncio.CancelledError):
             await proxy_server
+        await asyncio.sleep(0.1)
 
     event_loop.run_until_complete(_cancel_server())
     return

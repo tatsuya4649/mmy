@@ -119,6 +119,7 @@ class ProxyConnection(Connection):
 
     async def _write_key_data(self):
         _b: bytes = self._key_data.to_bytes()
+        client_logger.debug(f"Write KeyData: {len(_b)}")
         self._writer.write(_b)
         await self._writer.drain()
 
@@ -345,7 +346,6 @@ class ProxyConnection(Connection):
                 self.host_info = "socket %s:%d" % (self._host, self._port)
 
             await self._write_key_data()
-
             self._next_seq_id = 0
 
             await self._get_server_information()

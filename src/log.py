@@ -8,7 +8,7 @@ def init_log():
     logger.remove()
     logger.add(
         sys.stdout,
-        format="<green>{time:HH:mm:ss.SSS}</green> <level>{level}</level> {message}",
+        format="<green>{time:HH:mm:ss.SSS}</green> <level>{level}</level> <cyan>{function}</cyan>:<cyan>{line}</cyan> {message}",
         colorize=True,
         level="DEBUG",
     )
