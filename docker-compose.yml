@@ -18,8 +18,8 @@ services:
         ipv4_address: 172.16.0.5
 
   mysql1:
-    container_name: "mmysql1"
-    image: mysql:8.0.32
+    container_name: "mmy1"
+    image: mysql:8
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: test
@@ -31,8 +31,8 @@ services:
       - 10001:3306
 
   mysql2:
-    container_name: "mmysql2"
-    image: mysql:8.0.32
+    container_name: "mmy2"
+    image: mysql:8
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: test

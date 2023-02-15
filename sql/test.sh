@@ -1,5 +1,20 @@
 #!/bin/bash
 
+echo "============================"
+echo "CREATE TSL/SSL KEYS"
+echo "============================"
+
+mysql_ssl_rsa_setup
+cd /var/lib/mysql
+openssl rsa -in client-key.pem -out client-key.pem
+openssl rsa -in server-key.pem -out server-key.pem
+
+ls -l /var/lib/mysql/*.pem
+
+test.sh
+docker-entrypoint.sh
+mysql -uroot -proot -s -N -e "SHOW VARIABLES LIKE '%ssl%';"
+
 COUNT=12
 MIN_COUNT=10000
 echo "======== Generate random user data ========"

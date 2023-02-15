@@ -8,7 +8,7 @@ import pytest_asyncio
 from pymysql.err import OperationalError
 from python_on_whales import docker
 from rich import print
-from src.mysql import (
+from src.mysql.client import (
     INSERT_ONCE_LIMIT,
     MySQLAuthInfo,
     MySQLAuthInfoByTable,
@@ -31,12 +31,12 @@ class container:
 class DockerMySQL(Enum):
     MySQL1 = container(
         service_name="mysql1",
-        container_name="mmysql1",
+        container_name="mmy1",
         port=10001,
     )
     MySQL2 = container(
         service_name="mysql2",
-        container_name="mmysql2",
+        container_name="mmy2",
         port=10002,
     )
 
@@ -126,6 +126,7 @@ async def up_mysql():
     RETRY_COUNT: int = 10
     for _ in range(RETRY_COUNT):
         for mysql in docker_mysqls:
+            print(f'UP "{mysql.service_name}" container')
             _, port = docker.compose.port(mysql.service_name, 3306)
 
             try:

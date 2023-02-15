@@ -1,6 +1,8 @@
 import asyncio
+import os
 
 import click
+import httpx
 from loguru import logger
 from rich import print
 from src.etcd import MySQLEtcdClient, MySQLEtcdData
@@ -40,8 +42,14 @@ async def check_mysql(etcd: _Server):
             logger.info(
                 f"MySQL servers. {[address_from_server(i) for i in data.nodes]}"
             )
+    except httpx.ConnectError as e:
+        logger.error(
+            f"Can't connect to etcd cluster. (with {address_from_server(etcd)})"
+        )
+        print("\n")
+        print("\t[bold]Please fix and try. Bye.[/bold]")
+        print("\n")
     except Exception as e:
-        import os
 
         logger.exception(e)
         print("\n")

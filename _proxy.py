@@ -1,10 +1,10 @@
 import asyncio
 
-from src.mysql.proxy_connection import connect
+from src.mysql.proxy_connection import proxy_connect
 
 
 async def main():
-    c = connect(
+    c = proxy_connect(
         key="hello",
         user="root",
         password="root",
