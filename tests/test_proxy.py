@@ -1,6 +1,8 @@
 import asyncio
 import os
+import random
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -13,68 +15,88 @@ from python_on_whales import docker
 from rich import print
 
 from mmy.mysql.hosts import MySQLHosts
-from mmy.mysql.proxy import proxy_handler
+from mmy.mysql.proxy import ProxyServer, create_server
 from mmy.mysql.proxy_connection import ProxyConnection, proxy_connect
 from mmy.mysql.proxy_err import MmyUnmatchServerError
-from mmy.server import _Server
+from mmy.server import Server, State, _Server
 
 from .test_mysql import TEST_TABLE1, DockerMySQL, container
 
 HOST = "127.0.0.1"
-_MYSQL_HOSTS = MySQLHosts()
 PROXY_SERVER_STARTUP_TIMEOUT: int = 10
 
 
 @pytest.fixture()
-def proxy_server_start(event_loop: asyncio.AbstractEventLoop, unused_tcp_port: int):
-    async def _run_proxy_server():
-        _server = asyncio.start_server(
-            lambda r, w: proxy_handler(
-                mysql_hosts=_MYSQL_HOSTS,
-                client_reader=r,
-                client_writer=w,
-                connection_timeout=1,
-                command_timeout=1,
-            ),
-            HOST,
-            unused_tcp_port,
-        )
-        _s = await _server
-        async with _s:
-            await _s.serve_forever()
-
-    proxy_server = event_loop.create_task(_run_proxy_server())
-    # Waiting for start up server
-    async def _ping_proxy_server():
-        while True:
-            try:
-                _, writer = await asyncio.open_connection(
-                    HOST,
-                    unused_tcp_port,
-                )
-                writer.close()
-                await writer.wait_closed()
-                return
-            except ConnectionRefusedError:
-                await asyncio.sleep(0.05)
-                continue
-
-    async def _timeout_ping():
-        await asyncio.wait_for(
-            _ping_proxy_server(),
-            timeout=PROXY_SERVER_STARTUP_TIMEOUT,
+def mysql_hosts():
+    _mh = MySQLHosts()
+    _servers = list()
+    for i in DockerMySQL.__members__.values():
+        _cont = i.value
+        _servers.append(
+            Server(
+                host=_cont.host,
+                port=_cont.port,
+                state=State.Run,
+            )
         )
 
-    event_loop.run_until_complete(_timeout_ping())
-    yield unused_tcp_port
+    _mh.update(_servers)
+    return _mh
 
-    async def _cancel_server():
-        proxy_server.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await proxy_server
-        await asyncio.sleep(0.1)
 
-    event_loop.run_until_complete(_cancel_server())
+@asynccontextmanager
+async def run_proxy_server(
+    mysql_hosts: MySQLHosts,
+    unused_tcp_port: int,
+):
+    ps = ProxyServer(
+        mysql_hosts=mysql_hosts,
+        host=HOST,
+        port=unused_tcp_port,
+        connection_timeout=1,
+        command_timeout=1,
+    )
+    task = asyncio.create_task(ps.serve())
+    try:
+        # Waiting for start up server
+        async def _ping_proxy_server():
+            while True:
+                try:
+                    _, writer = await asyncio.open_connection(
+                        HOST,
+                        unused_tcp_port,
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+                except ConnectionRefusedError:
+                    await asyncio.sleep(0.05)
+                    continue
+
+        async def _timeout_ping():
+            await asyncio.wait_for(
+                _ping_proxy_server(),
+                timeout=PROXY_SERVER_STARTUP_TIMEOUT,
+            )
+
+        await _timeout_ping()
+        yield ps
+    finally:
+        await ps.shutdown()
+        task.cancel()
+
+
+import pytest_asyncio
+
+
+@pytest_asyncio.fixture()
+async def proxy_server_start(mysql_hosts, unused_tcp_port: int):
+    async with run_proxy_server(
+        mysql_hosts=mysql_hosts,
+        unused_tcp_port=unused_tcp_port,
+    ):
+        yield unused_tcp_port
+
     return
 
 
@@ -185,22 +207,28 @@ def create_client_certificate():
         )
 
 
+def fix_proxy_connect(key: str, port: int):
+    _client: ProxyConnection = proxy_connect(
+        key=key,
+        host=HOST,
+        port=port,
+        db="test",
+        user="root",
+        password="root",
+        connect_timeout=0.1,
+    )
+    return _client
+
+
 @pytest.mark.asyncio
 async def test_proxy(
     proxy_server_start,
 ):
+    port = proxy_server_start
     random_key = str(time.time_ns())
-
-    _client: ProxyConnection = proxy_connect(
-        key=random_key,
-        host=HOST,
-        port=proxy_server_start,
-        db="test",
-        user="root",
-        password="root",
-    )
-    async with _client as connect:
+    async with await fix_proxy_connect(random_key, port) as connect:
         await connect.ping()
+        print("Helo?")
 
 
 @pytest.mark.asyncio
@@ -221,16 +249,7 @@ async def test_SSL(
     ctx.options |= ssl.OP_NO_SSLv3
 
     random_key = str(time.time_ns())
-    _client: ProxyConnection = proxy_connect(
-        key=random_key,
-        host=HOST,
-        port=proxy_server_start,
-        db="test",
-        user="root",
-        password="root",
-        ssl=ctx,
-    )
-    async with _client as connect:
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
         await connect.ping()
 
 
@@ -240,19 +259,14 @@ async def test_select(
 ):
     random_key = str(time.time_ns())
 
-    _client: ProxyConnection = proxy_connect(
-        key=random_key,
-        host=HOST,
-        port=proxy_server_start,
-        db="test",
-        user="root",
-        password="root",
-    )
-    async with _client as connect:
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             length = 100
-            await cursor.execute("SELECT * FROM %s LIMIT %d" % (TEST_TABLE1, length))
+            await cursor.execute(
+                key=random_key,
+                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE1, length),
+            )
             res = await cursor.fetchall()
             assert isinstance(res, list)
             assert len(res) == length
@@ -264,15 +278,7 @@ async def test_insert(
 ):
     random_key = str(time.time_ns())
 
-    _client: ProxyConnection = proxy_connect(
-        key=random_key,
-        host=HOST,
-        port=proxy_server_start,
-        db="test",
-        user="root",
-        password="root",
-    )
-    async with _client as connect:
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             res = await cursor.execute(
@@ -289,30 +295,23 @@ async def test_update(
     proxy_server_start,
 ):
     random_key = int(time.time_ns())
+    random_id = random.randint(100000, 200000)
 
-    _client: ProxyConnection = proxy_connect(
-        key=str(random_key),
-        host=HOST,
-        port=proxy_server_start,
-        db="test",
-        user="root",
-        password="root",
-    )
-    async with _client as connect:
+    async with fix_proxy_connect(str(random_key), proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             res = await cursor.execute(
-                key=str(random_key),
+                key=str(random_id),
                 query="INSERT INTO %s (id, name) VALUES (%d, %s)"
-                % (TEST_TABLE1, random_key, str(random_key)),
+                % (TEST_TABLE1, random_id, str(random_key)),
             )
             assert res == 1
 
             new_name = str(time.time_ns())
             res = await cursor.execute(
                 key=str(random_key),
-                sql="UPDATE %s SET name=%s WHERE id=%d"
-                % (TEST_TABLE1, new_name, random_key),
+                query="UPDATE %s SET name=%s WHERE id=%d"
+                % (TEST_TABLE1, new_name, random_id),
             )
             assert res == 1
 
@@ -325,15 +324,7 @@ async def test_delete(
 ):
     random_key = str(time.time_ns())
 
-    _client: ProxyConnection = proxy_connect(
-        key=random_key,
-        host=HOST,
-        port=proxy_server_start,
-        db="test",
-        user="root",
-        password="root",
-    )
-    async with _client as connect:
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             res = await cursor.execute(
@@ -356,19 +347,11 @@ async def test_delete(
 
 
 @pytest.mark.asyncio
-async def test_show(
+async def test_show_variables(
     proxy_server_start,
 ):
     random_key = str(time.time_ns())
-    _client: ProxyConnection = proxy_connect(
-        key=random_key,
-        host=HOST,
-        port=proxy_server_start,
-        db="test",
-        user="root",
-        password="root",
-    )
-    async with _client as connect:
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             await cursor.execute(
@@ -386,8 +369,6 @@ async def test_diffrent_mysql_server_error(
     proxy_server_start,
     mocker,
 ):
-    _port = proxy_server_start
-
     def _select_mysql_host(_cont: container) -> _Server:
         return _Server(
             host=_cont.host,
@@ -402,15 +383,7 @@ async def test_diffrent_mysql_server_error(
 
     mocker.patch("mmy.mysql.proxy.select_mysql_host", side_effect=_select_mysql_host1)
     random_key = str(time.time_ns())
-    _client: ProxyConnection = proxy_connect(
-        key=random_key,
-        host=HOST,
-        port=_port,
-        db="test",
-        user="root",
-        password="root",
-    )
-    async with _client as connect:
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
         mocker.patch(
             "mmy.mysql.proxy.select_mysql_host", side_effect=_select_mysql_host2
         )

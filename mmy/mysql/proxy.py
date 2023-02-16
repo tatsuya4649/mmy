@@ -43,12 +43,7 @@ class KeyData:
 
 
 async def select_mysql_host(mysql_hosts: MySQLHosts, key_data: KeyData) -> _Server:
-    import ipaddress
-
-    return _Server(
-        host=ipaddress.ip_address("127.0.0.1"),
-        port=10001,
-    )
+    return mysql_hosts.get_host(key_data.data.decode("utf-8"))
 
 
 from enum import Enum, auto
@@ -1340,13 +1335,13 @@ async def proxy_handler(
     )
 
 
-async def run_proxy_server(
+async def create_server(
     mysql_hosts: MySQLHosts,
     host: str,
     port: int,
     connection_timeout: int,
     command_timeout: int,
-):
+) -> asyncio.Server:
     server = await asyncio.start_server(
         lambda r, w: proxy_handler(
             mysql_hosts=mysql_hosts,
@@ -1358,6 +1353,50 @@ async def run_proxy_server(
         host,
         port,
     )
+    return server
+
+
+async def run_proxy_server(*args, **kwargs):
+    server: socketserver.BaseServer = await create_server(*args, **kwargs)
     logger.info("Start proxy")
     async with server:
         await server.serve_forever()
+
+
+class ProxyServer:
+    def __init__(
+        self,
+        mysql_hosts: MySQLHosts,
+        host: str,
+        port: int,
+        connection_timeout: int,
+        command_timeout: int,
+    ):
+        self._mysql_hosts = mysql_hosts
+        self._host = host
+        self._port = port
+        self._connection_timeout = connection_timeout
+        self._command_timeout = command_timeout
+        self._servers: list[asyncio.Server] = list()
+
+    async def serve(self):
+        server: asyncio.Server = await asyncio.start_server(
+            lambda r, w: proxy_handler(
+                mysql_hosts=self._mysql_hosts,
+                client_reader=r,
+                client_writer=w,
+                connection_timeout=self._connection_timeout,
+                command_timeout=self._command_timeout,
+            ),
+            self._host,
+            self._port,
+        )
+        await asyncio.sleep(0.1)
+        self._servers.append(server)
+
+    async def shutdown(self):
+        for server in self._servers:
+            server.close()
+
+        for server in self._servers:
+            await server.wait_closed()

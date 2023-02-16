@@ -8,6 +8,7 @@ services:
     networks:
       etcd-network:
         ipv4_address: 172.16.0.4
+    mem_limit: 100m
   etcd2:
     build: .
     ports: [ "12381:12381", "12382:12382" ]
@@ -16,6 +17,7 @@ services:
     networks:
       etcd-network:
         ipv4_address: 172.16.0.5
+    mem_limit: 100m
 
   mysql1:
     container_name: "mmy1"
@@ -27,6 +29,7 @@ services:
       MYSQL_PASSWORD: docker
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
+      - ./docker/conf:/etc/mysql/conf.d
     ports:
       - 10001:3306
 
@@ -38,10 +41,11 @@ services:
       MYSQL_DATABASE: test
       MYSQL_USER: docker
       MYSQL_PASSWORD: docker
-    ports:
-      - 10002:3306
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
+      - ./docker/conf:/etc/mysql/conf.d
+    ports:
+      - 10002:3306
 
 networks:
   etcd-network:

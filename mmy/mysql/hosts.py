@@ -1,9 +1,10 @@
 from typing import Any
 
+from loguru import logger
 from uhashring import HashRing
 
 from ..ring import MySQLMetaRing, Node
-from ..server import Server
+from ..server import Server, _Server
 
 
 class MySQLHosts(MySQLMetaRing):
@@ -22,8 +23,15 @@ class MySQLHosts(MySQLMetaRing):
             }
         self._ring = HashRing(nodes=_nodes)
 
-    def get_host(self, key: str):
+    def get_host(self, key: str) -> _Server:
         if self._ring.size == 0:
             raise RuntimeError("No hosts")
+
         _h = self._ring.get(key)
-        return _h["instance"]
+        logger.debug(f"Get server from key: {key}")
+        logger.debug(_h)
+        _s = _h["instance"]
+        return _Server(
+            host=_s.host,
+            port=_s.port,
+        )
