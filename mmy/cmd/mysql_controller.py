@@ -5,11 +5,12 @@ from cmd import Cmd
 import click
 from loguru import logger
 from rich import print
-from src.etcd import MySQLEtcdClient, MySQLEtcdNotFoundNode
-from src.log import init_log
-from src.mysql.add import _add_main
-from src.server import _Server, address_from_server
-from src.state import state_main
+
+from mmy.etcd import MySQLEtcdClient, MySQLEtcdNotFoundNode
+from mmy.log import init_log
+from mmy.mysql.add import _add_main
+from mmy.server import _Server, address_from_server
+from mmy.state import state_main
 
 
 async def _delete_main(server: _Server):

@@ -10,9 +10,14 @@ from rich import print
 
 from ..const import SYSTEM_NAME
 from ..server import _Server, address_from_server
-from .errcode import MySQLErrorCode
 from .hosts import MySQLHosts
-from .packet import ErrorPacket, send_error_packet_to_client
+from .packet import send_error_packet_to_client
+from .proxy_err import (
+    MmyProtocolError,
+    MmyReadTimeout,
+    MmyTLSUnsupportError,
+    MmyUnmatchServerError,
+)
 
 PROTOCOL_ID: bytes = b"_MMY"
 
@@ -153,8 +158,22 @@ class MySQLPacketWithDirection:
     exception: Exception | None = None
 
 
+class EOFWhere(Enum):
+    client = auto()
+    server = auto()
+
+
 class EOF(ValueError):
-    pass
+    def __init__(
+        self,
+        where: EOFWhere,
+    ):
+        self.where: EOFWhere = where
+
+    def __str__(self):
+        return "Detect EOF from %s" % (
+            "client" if self.where is EOFWhere.client else "server"
+        )
 
 
 class MySQLForceShutdownConnection(RuntimeError):
@@ -298,6 +317,8 @@ class MySQLProxyContext:
         self._connection_phase: MySQLConnectionPhase = MySQLConnectionPhase.Init
         self._auth_plugin: MySQLAuthPlugin | None = None
         self._handshake_response_packet: HandshakeResponsePacket | None = None
+        self._server: _Server | None = None
+        self._last_packet: MySQLPacket | None = None
 
     def update_connection_phase(self, new: MySQLConnectionPhase):
         self._connection_phase = new
@@ -324,8 +345,7 @@ class MySQLProxyContext:
         logger.debug("Waiting for receiving data")
         _header: bytes = await reader.read(4)
         if reader.at_eof():
-            logger.debug(f"EOF in {__file__}")
-            raise EOF
+            raise EOF(EOFWhere.client if MySQLProxyDirection.CtoS else EOFWhere.server)
 
         logger.debug("Received header data(4bytes)")
         _modified_header: bytes = _header[:3] + b"\x00" + _header[3:]
@@ -358,7 +378,8 @@ class MySQLProxyContext:
             header=_header,
             payload=_payload,
             empty_packet=payload_length == 0,
-            auth_more=_first_payload == b"\x01",
+            auth_more=self._phase is MySQLConnectionLifecycle.Connetion
+            and _first_payload == b"\x01",
             ok=_first_payload == b"\x00" or _payload[:1] == b"\xfe",
             error=_first_payload == b"\xff",
             local_infile=_first_payload == b"\xfb",
@@ -366,6 +387,7 @@ class MySQLProxyContext:
             first_payload=_first_payload,
             command_type=_command_type,
         )
+        self._last_packet = packet
         return packet
 
     async def send_package(
@@ -469,7 +491,8 @@ class MySQLProxyContext:
 
     async def _only_deliver(
         self,
-        fn: FromToHandler | None,
+        stoc_fn: FromToHandler | None,
+        ctos_fn: FromToHandler | None,
     ) -> list[MySQLPacketWithDirection]:
         """
 
@@ -507,8 +530,11 @@ class MySQLProxyContext:
                 except asyncio.CancelledError as e:
                     logger.debug("Cancel pending task")
 
-        ctos = asyncio.create_task(_ctos())
-        stoc = asyncio.create_task(_stoc())
+        ctos: asyncio.Task = asyncio.create_task(_ctos())
+        stoc: asyncio.Task = asyncio.create_task(_stoc())
+        _D = "_direction"
+        setattr(ctos, _D, MySQLProxyDirection.CtoS)
+        setattr(stoc, _D, MySQLProxyDirection.StoC)
         done, pending = await asyncio.wait(
             [ctos, stoc],
             return_when=asyncio.FIRST_COMPLETED,
@@ -517,6 +543,8 @@ class MySQLProxyContext:
 
         packets: list[MySQLPacketWithDirection] = list()
         for d in done:
+            assert hasattr(d, _D) is True
+            direction: MySQLProxyDirection = getattr(d, _D)
             try:
                 result: MySQLPacketWithDirection = d.result()
                 packets.append(result)
@@ -524,15 +552,15 @@ class MySQLProxyContext:
                 if result.direction is None or result.packet is None:
                     raise ValueError
 
-                direction: MySQLProxyDirection = result.direction
                 packet: MySQLPacket = result.packet
-                packet = await self._after_receive(packet=packet, fn=fn)
                 if direction is MySQLProxyDirection.CtoS:
+                    packet = await self._after_receive(packet=packet, fn=ctos_fn)
                     await self.send_package(
                         writer=self.server_writer,
                         packet=packet,
                     )
                 else:
+                    packet = await self._after_receive(packet=packet, fn=stoc_fn)
                     await self.send_package(
                         writer=self._client_writer,
                         packet=packet,
@@ -546,7 +574,11 @@ class MySQLProxyContext:
                     MySQLPacketWithDirection(
                         direction=None,
                         packet=None,
-                        exception=EOF(),
+                        exception=EOF(
+                            EOFWhere.client
+                            if direction is MySQLProxyDirection.CtoS
+                            else EOFWhere.server
+                        ),
                     )
                 )
 
@@ -579,10 +611,12 @@ class MySQLProxyContext:
     @log_debug_direction(MySQLProxyDirection.Bidirection)
     async def only_deliver(
         self,
-        fn: FromToHandler | None,
+        stoc_fn: FromToHandler | None,
+        ctos_fn: FromToHandler | None,
     ) -> list[MySQLPacketWithDirection]:
         return await self._only_deliver(
-            fn=fn,
+            stoc_fn=stoc_fn,
+            ctos_fn=ctos_fn,
         )
 
     def is_auth_more_packet(self, packet: MySQLPacket):
@@ -782,7 +816,7 @@ class MySQLProxyContext:
             raise RuntimeError("Bug of rewriting Initial Handshake Packet")
         return packet
 
-    async def handle_client_flags(self) -> None:
+    async def handle_client_flags(self, packet: MySQLPacket) -> None:
         """
 
         SSL: not support
@@ -793,13 +827,10 @@ class MySQLProxyContext:
             and CapabilitiesFlags.CLIENT_SSL in self.server_capabilities
         ):
             logger.error(f"{SYSTEM_NAME} is not SSL/TLS support")
-            error_packet = ErrorPacket(
-                error_code=MySQLErrorCode.ER_NOT_SUPPORTED_YET,
-                error_message="Not support SSL/TLS",
-            )
             await send_error_packet_to_client(
                 client_writer=self._client_writer,
-                error_packet=error_packet,
+                sequence_id=packet.sequence_id + 1,
+                err=MmyTLSUnsupportError("Not support SSL/TLS"),
             )
             raise MySQLForceShutdownConnection
 
@@ -861,7 +892,7 @@ class MySQLProxyContext:
             f"Capabilities Flags of client: {','.join([i.name for i in self._client_capabilities])}"
         )
         packet = self.rewrite_handler_handshake_response(packet)
-        await self.handle_client_flags()
+        await self.handle_client_flags(packet)
         assert packet.payload is not None
 
         NULL_STR: bytes = b"\x00"
@@ -1042,7 +1073,8 @@ class MySQLProxyContext:
 
                     while True:
                         pds: list[MySQLPacketWithDirection] = await self.only_deliver(
-                            fn=None,
+                            ctos_fn=None,
+                            stoc_fn=None,
                         )
                         for pd in pds:
                             if pd.exception is not None:
@@ -1060,27 +1092,15 @@ class MySQLProxyContext:
 
                         # No OK or ERR packet
                         continue
-
-                    self.update_connection_phase(
-                        MySQLConnectionPhase.PluginCommunication
-                    )
         except asyncio.TimeoutError:
-            if self._direction is MySQLProxyDirection.CtoS:
-                error_packet = ErrorPacket(
-                    error_code=MySQLErrorCode.ER_NET_WRITE_INTERRUPTED,
-                    error_message="Writing Timeout in Connection phase",
-                )
-            else:
-                error_packet = ErrorPacket(
-                    error_code=MySQLErrorCode.ER_NET_READ_INTERRUPTED,
-                    error_message="Reading Timeout in Connection phase",
-                )
-
-            await send_error_packet_to_client(
-                client_writer=self._client_writer,
-                error_packet=error_packet,
-            )
+            logger.debug("Timeout on connection phase")
         return
+
+    @property
+    def last_packet(self) -> MySQLPacket:
+        if self._last_packet is None:
+            raise RuntimeError
+        return self._last_packet
 
     async def command_phase(
         self,
@@ -1090,10 +1110,16 @@ class MySQLProxyContext:
         logger.debug("========== Command Phase =============")
         self.update_direction(MySQLProxyDirection.CtoS)
         try:
+
+            async def wrap_command_keydata(packet: MySQLPacket) -> MySQLPacket:
+                await self.command_fetch_keydata(packet)
+                return packet
+
             while True:
                 pds: list[MySQLPacketWithDirection] = await asyncio.wait_for(
                     self.only_deliver(
-                        fn=None,
+                        ctos_fn=wrap_command_keydata,
+                        stoc_fn=None,
                     ),
                     timeout=command_timeout,
                 )
@@ -1104,27 +1130,19 @@ class MySQLProxyContext:
                     if pd.packet is None or pd.direction is None:
                         raise ValueError
         except asyncio.TimeoutError:
+            logger.debug("Timeout on Connection phase")
             if self._direction is MySQLProxyDirection.CtoS:
-                error_packet = ErrorPacket(
-                    error_code=MySQLErrorCode.ER_NET_WRITE_INTERRUPTED,
-                    error_message="Writing Timeout in Command phase",
+                await send_error_packet_to_client(
+                    client_writer=self._client_writer,
+                    sequence_id=self.last_packet.sequence_id + 1,
+                    err=MmyReadTimeout("Writing Timeout in Command phase"),
                 )
-            else:
-                error_packet = ErrorPacket(
-                    error_code=MySQLErrorCode.ER_NET_READ_INTERRUPTED,
-                    error_message="Reading Timeout in Command phase",
-                )
-
-            await send_error_packet_to_client(
-                client_writer=self._client_writer,
-                error_packet=error_packet,
-            )
         return
 
-    async def _fetch_host_by_data(self) -> KeyData:
+    async def _fetch_keydata(self) -> KeyData:
         logger.debug("+++++++++++++ KeyData phase +++++++++++++")
         if self._client_reader.at_eof():
-            raise EOF
+            raise EOF(EOFWhere.client)
 
         try:
             _header: bytes = await asyncio.wait_for(
@@ -1132,7 +1150,7 @@ class MySQLProxyContext:
                 timeout=KEY_DATA_TIMEOUT,
             )
         except asyncio.IncompleteReadError:
-            raise EOF
+            raise EOF(EOFWhere.client)
 
         if len(_header) != KEY_DATA_HEADER_LENGTH:
             raise ValueError(
@@ -1148,7 +1166,7 @@ class MySQLProxyContext:
             "<4sBi", _header[:KEY_DATA_HEADER_LENGTH]
         )
         if self._client_reader.at_eof():
-            raise EOF
+            raise EOF(EOFWhere.client)
         if protocol_id != PROTOCOL_ID:
             raise ProxyInvalidRequest
 
@@ -1161,13 +1179,46 @@ class MySQLProxyContext:
         logger.debug(f"KeyData length: {length}")
         logger.debug("KeyData data: %a" % (data))
         logger.debug("+++++++++++++++++++++++++++++++++++++++++")
-        self._key_data = KeyData(
+        return KeyData(
             protocol_id=protocol_id,
             version=version,
             length=length,
             data=data,
         )
+
+    async def initial_fetch_keydata(self) -> KeyData:
+        kd: KeyData = await self._fetch_keydata()
+        self._key_data = kd
         return self._key_data
+
+    async def command_fetch_keydata(self, packet: MySQLPacket) -> None:
+        assert self._phase is MySQLConnectionLifecycle.Command
+        if packet.command_type is MySQLCommandType.COM_QUIT:
+            return
+
+        logger.debug("Receive command KeyData")
+        _kd: KeyData = await self._fetch_keydata()
+        _s: _Server = await select_mysql_host(
+            mysql_hosts=self._mysql_hosts,
+            key_data=_kd,
+        )
+        if self.server != _s:
+            # mmy protocol error
+            await send_error_packet_to_client(
+                client_writer=self._client_writer,
+                sequence_id=packet.sequence_id + 1,
+                err=MmyUnmatchServerError(
+                    "MySQL server that is decided by KeyData value is different at the start of communication and now"
+                ),
+            )
+            raise MmyUnmatchServerError
+
+    @property
+    def server(self) -> _Server:
+        if self._server is None:
+            raise RuntimeError
+
+        return self._server
 
     async def select_server(self):
         server: _Server = await select_mysql_host(
@@ -1175,6 +1226,7 @@ class MySQLProxyContext:
             key_data=self.key_data,
         )
         logger.debug(f"Create connection with {address_from_server(server)}")
+        self._server = server
         self._server_reader, self._server_writer = await asyncio.open_connection(
             str(server.host), server.port
         )
@@ -1237,17 +1289,9 @@ async def _proxy_handler(
             mysql_hosts=mysql_hosts,
         )
         try:
-            await ctx._fetch_host_by_data()
+            await ctx.initial_fetch_keydata()
         except asyncio.TimeoutError:
-            logger.debug("Timeout error in KeyData")
-            error_packet = ErrorPacket(
-                error_code=MySQLErrorCode.ER_HANDSHAKE_ERROR,
-                error_message="This is mmy system, please KeyData packet on connection from client",
-            )
-            await send_error_packet_to_client(
-                client_writer=client_writer,
-                error_packet=error_packet,
-            )
+            logger.debug("Timeout error on Initial KeyData")
             return
         except ProxyInvalidRequest:
             logger.debug("Invalid request")
@@ -1269,12 +1313,15 @@ async def _proxy_handler(
             return
 
         logger.debug("End proxy handler")
-    except EOF:
-        logger.debug("Detect EOF")
+    except EOF as e:
+        logger.debug(e)
+    except MmyProtocolError as e:
+        logger.error(e)
     except MySQLForceShutdownConnection:
         logger.debug("Force shutdown connection")
     finally:
         await ctx.release()
+        logger.debug("End of connection")
 
 
 async def proxy_handler(

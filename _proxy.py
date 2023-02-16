@@ -1,6 +1,6 @@
 import asyncio
 
-from src.mysql.proxy_connection import proxy_connect
+from mmy.mysql.proxy_connection import proxy_connect
 
 
 async def main():

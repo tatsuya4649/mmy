@@ -1,9 +1,9 @@
 import asyncio
 import ipaddress
 
-from src.etcd import MySQLEtcdClient, MySQLEtcdData
-from src.log import init_log
-from src.server import State, _Server
+from mmy.etcd import MySQLEtcdClient, MySQLEtcdData
+from mmy.log import init_log
+from mmy.server import State, _Server
 
 etcd = MySQLEtcdClient()
 

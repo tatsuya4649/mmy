@@ -1,7 +1,7 @@
 import asyncio
 
-from src.log import init_log
-from src.ring import MySQLRing, Node
+from mmy.log import init_log
+from mmy.ring import MySQLRing, Node
 
 if __name__ == "__main__":
     init_log()

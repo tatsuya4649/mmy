@@ -15,6 +15,9 @@ class _Server:
     host: ipaddress.IPv4Address | ipaddress.IPv6Address
     port: int
 
+    def __eq__(self, other):
+        return self.host == other.host and self.port == other.port
+
 
 @dataclass
 class Server(_Server):

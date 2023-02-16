@@ -11,11 +11,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from python_on_whales import docker
 from rich import print
-from src.mysql.hosts import MySQLHosts
-from src.mysql.proxy import proxy_handler
-from src.mysql.proxy_connection import ProxyConnection, proxy_connect
 
-from .test_mysql import DockerMySQL, container
+from mmy.mysql.hosts import MySQLHosts
+from mmy.mysql.proxy import proxy_handler
+from mmy.mysql.proxy_connection import ProxyConnection, proxy_connect
+from mmy.mysql.proxy_err import MmyUnmatchServerError
+from mmy.server import _Server
+
+from .test_mysql import TEST_TABLE1, DockerMySQL, container
 
 HOST = "127.0.0.1"
 _MYSQL_HOSTS = MySQLHosts()
@@ -45,7 +48,10 @@ def proxy_server_start(event_loop: asyncio.AbstractEventLoop, unused_tcp_port: i
     async def _ping_proxy_server():
         while True:
             try:
-                _, writer = await asyncio.open_connection(HOST, unused_tcp_port)
+                _, writer = await asyncio.open_connection(
+                    HOST,
+                    unused_tcp_port,
+                )
                 writer.close()
                 await writer.wait_closed()
                 return
@@ -226,3 +232,196 @@ async def test_SSL(
     )
     async with _client as connect:
         await connect.ping()
+
+
+@pytest.mark.asyncio
+async def test_select(
+    proxy_server_start,
+):
+    random_key = str(time.time_ns())
+
+    _client: ProxyConnection = proxy_connect(
+        key=random_key,
+        host=HOST,
+        port=proxy_server_start,
+        db="test",
+        user="root",
+        password="root",
+    )
+    async with _client as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            length = 100
+            await cursor.execute("SELECT * FROM %s LIMIT %d" % (TEST_TABLE1, length))
+            res = await cursor.fetchall()
+            assert isinstance(res, list)
+            assert len(res) == length
+
+
+@pytest.mark.asyncio
+async def test_insert(
+    proxy_server_start,
+):
+    random_key = str(time.time_ns())
+
+    _client: ProxyConnection = proxy_connect(
+        key=random_key,
+        host=HOST,
+        port=proxy_server_start,
+        db="test",
+        user="root",
+        password="root",
+    )
+    async with _client as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            res = await cursor.execute(
+                key=random_key,
+                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE1, random_key),
+            )
+            assert res == 1
+
+        await connect.commit()
+
+
+@pytest.mark.asyncio
+async def test_update(
+    proxy_server_start,
+):
+    random_key = int(time.time_ns())
+
+    _client: ProxyConnection = proxy_connect(
+        key=str(random_key),
+        host=HOST,
+        port=proxy_server_start,
+        db="test",
+        user="root",
+        password="root",
+    )
+    async with _client as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            res = await cursor.execute(
+                key=str(random_key),
+                query="INSERT INTO %s (id, name) VALUES (%d, %s)"
+                % (TEST_TABLE1, random_key, str(random_key)),
+            )
+            assert res == 1
+
+            new_name = str(time.time_ns())
+            res = await cursor.execute(
+                key=str(random_key),
+                sql="UPDATE %s SET name=%s WHERE id=%d"
+                % (TEST_TABLE1, new_name, random_key),
+            )
+            assert res == 1
+
+        await connect.commit()
+
+
+@pytest.mark.asyncio
+async def test_delete(
+    proxy_server_start,
+):
+    random_key = str(time.time_ns())
+
+    _client: ProxyConnection = proxy_connect(
+        key=random_key,
+        host=HOST,
+        port=proxy_server_start,
+        db="test",
+        user="root",
+        password="root",
+    )
+    async with _client as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            res = await cursor.execute(
+                key=random_key,
+                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE1, random_key),
+            )
+            assert res == 1
+
+        await connect.commit()
+
+        cursor = await connect.cursor()
+        async with cursor:
+            res = await cursor.execute(
+                key=random_key,
+                query="DELETE FROM %s WHERE name=%s" % (TEST_TABLE1, random_key),
+            )
+            assert res == 1
+
+        await connect.commit()
+
+
+@pytest.mark.asyncio
+async def test_show(
+    proxy_server_start,
+):
+    random_key = str(time.time_ns())
+    _client: ProxyConnection = proxy_connect(
+        key=random_key,
+        host=HOST,
+        port=proxy_server_start,
+        db="test",
+        user="root",
+        password="root",
+    )
+    async with _client as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            await cursor.execute(
+                key=random_key,
+                query="SHOW VARIABLES",
+            )
+            res = await cursor.fetchall()
+            assert isinstance(res, list)
+            for item in res:
+                assert isinstance(item, dict)
+
+
+@pytest.mark.asyncio
+async def test_diffrent_mysql_server_error(
+    proxy_server_start,
+    mocker,
+):
+    _port = proxy_server_start
+
+    def _select_mysql_host(_cont: container) -> _Server:
+        return _Server(
+            host=_cont.host,
+            port=_cont.port,
+        )
+
+    async def _select_mysql_host1(*args, **kwargs) -> _Server:
+        return _select_mysql_host(DockerMySQL.MySQL1.value)
+
+    async def _select_mysql_host2(*args, **kwargs) -> _Server:
+        return _select_mysql_host(DockerMySQL.MySQL2.value)
+
+    mocker.patch("mmy.mysql.proxy.select_mysql_host", side_effect=_select_mysql_host1)
+    random_key = str(time.time_ns())
+    _client: ProxyConnection = proxy_connect(
+        key=random_key,
+        host=HOST,
+        port=_port,
+        db="test",
+        user="root",
+        password="root",
+    )
+    async with _client as connect:
+        mocker.patch(
+            "mmy.mysql.proxy.select_mysql_host", side_effect=_select_mysql_host2
+        )
+        cursor = await connect.cursor()
+        async with cursor:
+            with pytest.raises(MmyUnmatchServerError):
+                await cursor.execute(
+                    key=random_key,
+                    query="SHOW VARIABLES LIKE 'time_zone'",
+                )
+                res = await cursor.fetchall()
+                assert isinstance(res, list)
+                for item in res:
+                    assert isinstance(item, dict)

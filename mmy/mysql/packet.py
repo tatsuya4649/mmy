@@ -4,12 +4,14 @@ from dataclasses import dataclass
 
 from ..const import SYSTEM_NAME
 from .errcode import MySQLErrorCode
+from .proxy_err import MmyError
 
 
 def create_error_packet(
     error_code: int,
     sql_state: str,
     error_message: str,
+    sequence_id: int,
 ):
     error_message_bytes: bytes = error_message.encode("utf-8")
     payload: bytes = struct.pack(
@@ -21,7 +23,9 @@ def create_error_packet(
         error_message_bytes,
     )
     _payload_length: bytes = struct.pack("<i", len(payload))[:3]
-    _sequence_id: bytes = struct.pack("<B", 0)
+    if sequence_id < 0 or sequence_id > 255:
+        raise ValueError
+    _sequence_id: bytes = struct.pack("<B", sequence_id)
     _header = _payload_length + _sequence_id
     return _header + payload
 
@@ -34,16 +38,20 @@ class ErrorPacket:
 
 async def send_error_packet_to_client(
     client_writer: asyncio.StreamWriter,
-    error_packet: ErrorPacket,
+    sequence_id: int,
+    err: MmyError,
 ):
     try:
-        _add_system_name: str = f"[{SYSTEM_NAME}] " + error_packet.error_message
+        _add_system_name: str = f"[{SYSTEM_NAME}({err.errno()})] " + str(err)
+        _mysql_error = err.mysql_error()
         packet: bytes = create_error_packet(
-            error_code=error_packet.error_code.value.error_code,
+            error_code=_mysql_error.value.error_code,
             error_message=_add_system_name,
-            sql_state=error_packet.error_code.value.sql_state.value,
+            sql_state=_mysql_error.value.sql_state.value,
+            sequence_id=sequence_id,
         )
         client_writer.write(packet)
         await client_writer.drain()
     finally:
         client_writer.close()
+        raise err

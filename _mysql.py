@@ -5,7 +5,8 @@ from typing import Literal
 
 from dacite import Config, from_dict
 from rich import print
-from src.mysql import MySQLClient
+
+from mmy.mysql import MySQLClient
 
 
 async def main():

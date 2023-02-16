@@ -1,7 +1,8 @@
 import asyncio
 
 import pytest
-from src.log import init_log
+
+from mmy.log import init_log
 
 init_log()
 

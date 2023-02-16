@@ -1,6 +1,7 @@
 from rich import print
-from src.mysql.hosts import MySQLHosts
-from src.server import Server, State
+
+from mmy.mysql.hosts import MySQLHosts
+from mmy.server import Server, State
 
 mh = MySQLHosts()
 mh.update(

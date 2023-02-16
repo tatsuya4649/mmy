@@ -1,40 +1,22 @@
 import asyncio
-import copy
-import logging
 import struct
-import sys
 import warnings
 
+import pymysql
 from aiomysql.connection import Connection, _open_connection, _open_unix_connection
-from aiomysql.cursors import Cursor
 from aiomysql.utils import _ConnectionContextManager, _lenenc_int
-from pymysql import _auth
+from pymysql import connections
 from pymysql.charset import charset_by_name
-from pymysql.connections import MAX_PACKET_LEN, MysqlPacket
 from pymysql.constants import CLIENT, CR
 from pymysql.converters import decoders
 from pymysql.err import InternalError, OperationalError
 from rich import print
 
 from ..const import SYSTEM_NAME
+from .client_log import client_logger
 from .proxy import KeyData
-
-
-def _init_client_logger() -> logging.Logger:
-    logging.basicConfig(level=logging.DEBUG)
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(
-        f"[{SYSTEM_NAME} Client] %(asctime)s %(levelname)s %(message)s"
-    )
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-    return logger
-
-
-client_logger = _init_client_logger()
+from .proxy_cursors import DictCursor
+from .proxy_protocol import MmyPacket
 
 
 def proxy_connect(
@@ -50,7 +32,7 @@ def proxy_connect(
     conv=decoders,
     use_unicode=None,
     client_flag=0,
-    cursorclass=Cursor,
+    cursorclass=DictCursor,
     init_command=None,
     connect_timeout=None,
     read_default_group=None,
@@ -110,6 +92,9 @@ class ProxyConnection(Connection):
         #            raise ValueError("Unsupport TLS/SSL")
 
         super().__init__(**kwargs)
+        self.create_keydata_from_key(key)
+
+    def create_keydata_from_key(self, key: str):
         self._key = key
         self._bkey: bytes = key.encode("utf-8")
         self._key_data = KeyData(
@@ -117,13 +102,48 @@ class ProxyConnection(Connection):
             data=self._bkey,
         )
 
+    async def _execute_command(self, command, sql):
+        self._ensure_alive()
+
+        # If the last query was unbuffered, make sure it finishes before
+        # sending new commands
+        if self._result is not None:
+            if self._result.unbuffered_active:
+                warnings.warn("Previous unbuffered result was left incomplete")
+                await self._result._finish_unbuffered_query()
+            while self._result.has_next:
+                await self.next_result()
+            self._result = None
+
+        if isinstance(sql, str):
+            sql = sql.encode(self._encoding)
+
+        chunk_size = min(connections.MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
+
+        client_logger.debug("Send command: [%d] %s", command, sql)
+        prelude = struct.pack("<iB", chunk_size, command)
+        self._write_bytes(prelude + sql[: chunk_size - 1])
+        # logger.debug(dump_packet(prelude + sql))
+        self._next_seq_id = 1
+
+        if chunk_size >= connections.MAX_PACKET_LEN:
+            sql = sql[chunk_size - 1 :]
+            while True:
+                chunk_size = min(connections.MAX_PACKET_LEN, len(sql))
+                self.write_packet(sql[:chunk_size])
+                sql = sql[chunk_size:]
+                if not sql and chunk_size < connections.MAX_PACKET_LEN:
+                    break
+
+        await self._write_key_data()
+
     async def _write_key_data(self):
         _b: bytes = self._key_data.to_bytes()
         client_logger.debug(f"Write KeyData: {len(_b)}")
         self._writer.write(_b)
         await self._writer.drain()
 
-    async def _read_packet(self, packet_type=MysqlPacket):
+    async def _read_packet(self, packet_type=MmyPacket):
         """Read an entire "mysql packet" in its entirety from the network
         and return a MysqlPacket type that represents the results.
         """
@@ -169,7 +189,7 @@ class ProxyConnection(Connection):
             # https://dev.mysql.com/doc/internals/en/sending-more-than-16mbyte.html
             if bytes_to_read == 0xFFFFFF:
                 continue
-            if bytes_to_read < MAX_PACKET_LEN:
+            if bytes_to_read < connections.MAX_PACKET_LEN:
                 break
 
         packet = packet_type(buff, self._encoding)
@@ -189,7 +209,7 @@ class ProxyConnection(Connection):
 
         charset_id = charset_by_name(self.charset).id
         data_init = struct.pack(
-            "<iIB23s", self.client_flag, MAX_PACKET_LEN, charset_id, b""
+            "<iIB23s", self.client_flag, connections.MAX_PACKET_LEN, charset_id, b""
         )
 
         client_logger.debug(f"MySQL serevr: capabilities: {self.server_capabilities}")
@@ -236,12 +256,12 @@ class ProxyConnection(Connection):
 
         client_logger.debug(auth_plugin)
         if auth_plugin in ("", "mysql_native_password"):
-            authresp = _auth.scramble_native_password(
+            authresp = pymysql._auth.scramble_native_password(
                 self._password.encode("latin1"), self.salt
             )
         elif auth_plugin == "caching_sha2_password":
             if self._password:
-                authresp = _auth.scramble_caching_sha2(
+                authresp = pymysql._auth.scramble_caching_sha2(
                     self._password.encode("latin1"), self.salt
                 )
             # Else: empty password
@@ -310,7 +330,7 @@ class ProxyConnection(Connection):
             else:
                 # send legacy handshake
                 data = (
-                    _auth.scramble_old_password(
+                    pymysql._auth.scramble_old_password(
                         self._password.encode("latin1"), auth_packet.read_all()
                     )
                     + b"\0"

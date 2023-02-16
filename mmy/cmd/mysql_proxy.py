@@ -5,11 +5,12 @@ import click
 import httpx
 from loguru import logger
 from rich import print
-from src.etcd import MySQLEtcdClient, MySQLEtcdData
-from src.log import init_log
-from src.mysql.hosts import MySQLHosts
-from src.mysql.proxy import run_proxy_server
-from src.server import _Server, address_from_server
+
+from mmy.etcd import MySQLEtcdClient, MySQLEtcdData
+from mmy.log import init_log
+from mmy.mysql.hosts import MySQLHosts
+from mmy.mysql.proxy import run_proxy_server
+from mmy.server import _Server, address_from_server
 
 
 async def etcd_management(

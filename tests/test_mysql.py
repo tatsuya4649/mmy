@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 from dataclasses import dataclass
 from enum import Enum
 from typing import Coroutine
@@ -8,7 +9,8 @@ import pytest_asyncio
 from pymysql.err import OperationalError
 from python_on_whales import docker
 from rich import print
-from src.mysql.client import (
+
+from mmy.mysql.client import (
     INSERT_ONCE_LIMIT,
     MySQLAuthInfo,
     MySQLAuthInfoByTable,
@@ -25,6 +27,7 @@ from src.mysql.client import (
 class container:
     container_name: str
     service_name: str
+    host: ipaddress.IPv4Address | ipaddress.IPv6Address
     port: int
 
 
@@ -32,17 +35,19 @@ class DockerMySQL(Enum):
     MySQL1 = container(
         service_name="mysql1",
         container_name="mmy1",
+        host=ipaddress.ip_address("127.0.0.1"),
         port=10001,
     )
     MySQL2 = container(
         service_name="mysql2",
         container_name="mmy2",
+        host=ipaddress.ip_address("127.0.0.1"),
         port=10002,
     )
 
 
-TEST_TABLE1: str = "user"
-TEST_TABLE2: str = "post"
+TEST_TABLE1: TableName = TableName("user")
+TEST_TABLE2: TableName = TableName("post")
 ROOT: MySQLAuthInfo = MySQLAuthInfo(
     user="root",
     password="root",
@@ -113,7 +118,7 @@ class TMySQLClient(MySQLClient):
         return container.value.container_name not in [i.name for i in mcs]
 
 
-@pytest_asyncio.fixture(scope="class", autouse=True)
+@pytest_asyncio.fixture(scope="session", autouse=True)
 async def up_mysql():
     mcs = [i.value.service_name for i in list(DockerMySQL)]
     _run_containers = docker.compose.ps(mcs)

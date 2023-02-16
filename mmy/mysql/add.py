@@ -2,10 +2,11 @@ from typing import Coroutine
 
 from loguru import logger
 from rich import print
-from src.etcd import MySQLEtcdClient, MySQLEtcdData, MySQLEtcdDuplicateNode
-from src.log import init_log
-from src.ring import MySQLRing, Node
-from src.server import State, _Server, address_from_server, state_rich_str
+
+from mmy.etcd import MySQLEtcdClient, MySQLEtcdData, MySQLEtcdDuplicateNode
+from mmy.log import init_log
+from mmy.ring import MySQLRing, Node
+from mmy.server import State, _Server, address_from_server, state_rich_str
 
 
 async def _add_main(server: _Server):

@@ -1,5 +1,6 @@
 import pytest
-from src.pool import MySQLServerPool, Server, ServerID, ServerPool, State
+
+from mmy.pool import MySQLServerPool, Server, ServerID, ServerPool, State
 
 
 def test_server_pool():
