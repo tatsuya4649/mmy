@@ -14,10 +14,6 @@ from dacite import Config, from_dict
 from loguru import logger
 
 ETCD_SCHEME = "http"
-ETCD_HOST = "172.16.0.4"
-ETCD_PORT = 12379
-ETCD_ADDRESS = "%s://%s:%d" % (ETCD_SCHEME, ETCD_HOST, ETCD_PORT)
-
 STATUS_TIMEOUT = 3
 
 from typing import Generic, TypeVar
@@ -57,14 +53,14 @@ EtcdJson: TypeAlias = dict[str, Any]
 class EtcdClient(abc.ABC, Generic[_EtcdData]):
     def __init__(
         self,
+        host: ipaddress.IPv4Address | ipaddress.IPv6Address,
+        port: int,
         scheme: str = ETCD_SCHEME,
-        host: str = ETCD_HOST,
-        port: int = ETCD_PORT,
         timeout: int = STATUS_TIMEOUT,
     ):
         self._scheme = scheme
-        self._host = host
-        self._port = port
+        self._host: ipaddress.IPv4Address | ipaddress.IPv6Address = host
+        self._port: int = port
         self._address = "%s://%s:%d" % (scheme, host, port)
         self._timeout = timeout
 

@@ -14,22 +14,23 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from python_on_whales import docker
 from rich import print
 
-from mmy.mysql.hosts import MySQLHosts
+from mmy.mysql.hosts import MySQLHostBroken, MySQLHosts
 from mmy.mysql.proxy import ProxyServer
 from mmy.mysql.proxy_connection import ProxyConnection, proxy_connect
 from mmy.mysql.proxy_err import MmyLocalInfileUnsupportError, MmyUnmatchServerError
 from mmy.server import Server, State, _Server
 
-from .test_mysql import TEST_TABLE1, DockerMySQL, container
+from .conftest import TEST_TABLE1
+from .test_mysql import DockerMySQL, container
 
 HOST = "127.0.0.1"
 PROXY_SERVER_STARTUP_TIMEOUT: int = 10
 
 
-@pytest.fixture()
+@pytest.fixture
 def mysql_hosts():
     _mh = MySQLHosts()
-    _servers = list()
+    _servers: list[Server] = list()
     for i in DockerMySQL.__members__.values():
         _cont = i.value
         _servers.append(
@@ -39,7 +40,6 @@ def mysql_hosts():
                 state=State.Run,
             )
         )
-
     _mh.update(_servers)
     return _mh
 
@@ -417,3 +417,37 @@ async def test_diffrent_mysql_server_error(
                 assert isinstance(res, list)
                 for item in res:
                     assert isinstance(item, dict)
+
+
+@pytest.mark.asyncio
+async def test_broken_host(
+    proxy_server_start,
+    mocker,
+):
+    mocker.patch("mmy.mysql.proxy.select_mysql_host", side_effect=MySQLHostBroken)
+    random_key = str(time.time_ns())
+    with pytest.raises(MySQLHostBroken):
+        async with fix_proxy_connect(random_key, proxy_server_start) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                await cursor.ping()
+
+
+@pytest.mark.asyncio
+async def test_broken_host_on_command_phase(
+    proxy_server_start,
+    mocker,
+):
+    random_key = str(time.time_ns())
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            with pytest.raises(MySQLHostBroken):
+                mocker.patch(
+                    "mmy.mysql.proxy.select_mysql_host",
+                    side_effect=MySQLHostBroken,
+                )
+                await cursor.execute(
+                    key=random_key,
+                    query="SHOW VARIABLES LIKE 'time_zone'",
+                )

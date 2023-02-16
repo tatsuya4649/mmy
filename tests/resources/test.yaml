@@ -1,0 +1,13 @@
+---
+mysql:
+  db: test
+  default_userinfo:
+    user: root
+    password: root
+  tables:
+    - name: user
+      user: root
+      password: root
+    - name: post
+      user: root
+      password: root

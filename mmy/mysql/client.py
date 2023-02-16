@@ -180,8 +180,33 @@ _MySQLAuthInfoByTable: TypeAlias = dict[TableName, MySQLAuthInfo]
 
 @dataclass
 class MySQLAuthInfoByTable:
-    default: MySQLAuthInfo
-    by_tables: _MySQLAuthInfoByTable
+    default_userinfo: MySQLAuthInfo
+    tables: _MySQLAuthInfoByTable
+
+
+@dataclass
+class MySQLTableInfo(MySQLAuthInfo):
+    name: str
+
+
+@dataclass
+class MmyMySQLInfo:
+    db: str
+    tables: list[MySQLTableInfo]
+    default_userinfo: MySQLAuthInfo
+
+    def by_tables(self) -> MySQLAuthInfoByTable:
+        _ts: _MySQLAuthInfoByTable = dict()
+        for t in self.tables:
+            _ts[TableName(t.name)] = MySQLAuthInfo(
+                user=t.user,
+                password=t.password,
+            )
+
+        return MySQLAuthInfoByTable(
+            default_userinfo=self.default_userinfo,
+            tables=_ts,
+        )
 
 
 class MySQLClient:
@@ -191,22 +216,21 @@ class MySQLClient:
         self,
         host: ipaddress.IPv4Address | ipaddress.IPv6Address,
         port: int,
-        auth: MySQLAuthInfoByTable,
-        db: str,
+        auth: MmyMySQLInfo,
         connect_timeout: int = CONNECT_TIMEOUT,
     ):
         self._host = host
         self._port = port
-        self._db = db
-        self._auth = auth
+        self._db = auth.db
+        self._auth: MySQLAuthInfoByTable = auth.by_tables()
         self._connect_timeout = connect_timeout
 
     def _default_connect(self):
         return aiomysql.connect(
             host=str(self._host),
             port=self._port,
-            user=self._auth.default.user,
-            password=self._auth.default.password,
+            user=self._auth.default_userinfo.user,
+            password=self._auth.default_userinfo.password,
             db=self._db,
             cursorclass=DictCursor,
             charset="utf8mb4",
@@ -218,8 +242,8 @@ class MySQLClient:
         return aiomysql.connect(
             host=str(self._host),
             port=self._port,
-            user=self._auth.by_tables[table].user,
-            password=self._auth.by_tables[table].password,
+            user=self._auth.tables[table].user,
+            password=self._auth.tables[table].password,
             db=self._db,
             cursorclass=DictCursor,
             charset="utf8mb4",
@@ -542,5 +566,5 @@ class MySQLClient:
         async with self._default_connect() as connect:
             await asyncio.wait_for(
                 connect.ping(reconnect=False),
-                timeout=1,
+                timeout=10,
             )

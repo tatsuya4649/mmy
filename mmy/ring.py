@@ -320,7 +320,7 @@ class MySQLMetaRing:
     RING_VNODES: int = 80
 
     def nodename_from_node(self, node: Node) -> str:
-        return str(node.host)
+        return f"%s:%d" % (str(node.host), node.port)
 
 
 class MySQLRing(

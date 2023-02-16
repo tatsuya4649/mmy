@@ -10,8 +10,8 @@ from rich import print
 
 from ..const import SYSTEM_NAME
 from ..server import _Server, address_from_server
-from .hosts import MySQLHosts
-from .packet import send_error_packet_to_client
+from .hosts import MySQLHostBroken, MySQLHosts
+from .packet import send_error_packet_to_client, send_host_broken_packet
 from .proxy_err import (
     MmyLocalInfileUnsupportError,
     MmyProtocolError,
@@ -1198,10 +1198,16 @@ class MySQLProxyContext:
 
         logger.debug("Receive command KeyData")
         _kd: KeyData = await self._fetch_keydata()
-        _s: _Server = await select_mysql_host(
-            mysql_hosts=self._mysql_hosts,
-            key_data=_kd,
-        )
+        try:
+            _s: _Server = await select_mysql_host(
+                mysql_hosts=self._mysql_hosts,
+                key_data=_kd,
+            )
+        except MySQLHostBroken:
+            await send_host_broken_packet(
+                client_writer=self._client_writer,
+            )
+
         if self.server != _s:
             # mmy protocol error
             await send_error_packet_to_client(
@@ -1310,8 +1316,13 @@ async def _proxy_handler(
         except ProxyInvalidRequest:
             logger.debug("Invalid request")
             return
-
-        await ctx.select_server()
+        try:
+            await ctx.select_server()
+        except MySQLHostBroken:
+            await send_host_broken_packet(
+                client_writer=client_writer,
+            )
+            return
         try:
             # Connection Phase
             await asyncio.wait_for(

@@ -1,6 +1,5 @@
 import asyncio
 import ipaddress
-from dataclasses import dataclass
 from enum import Enum
 from typing import Coroutine
 
@@ -12,8 +11,6 @@ from rich import print
 
 from mmy.mysql.client import (
     INSERT_ONCE_LIMIT,
-    MySQLAuthInfo,
-    MySQLAuthInfoByTable,
     MySQLClient,
     MySQLClientTooManyInsertAtOnce,
     MySQLColumns,
@@ -22,13 +19,7 @@ from mmy.mysql.client import (
     _Extra,
 )
 
-
-@dataclass
-class container:
-    container_name: str
-    service_name: str
-    host: ipaddress.IPv4Address | ipaddress.IPv6Address
-    port: int
+from .docker import container
 
 
 class DockerMySQL(Enum):
@@ -64,21 +55,6 @@ class DockerMySQL(Enum):
     )
 
 
-TEST_TABLE1: TableName = TableName("user")
-TEST_TABLE2: TableName = TableName("post")
-ROOT: MySQLAuthInfo = MySQLAuthInfo(
-    user="root",
-    password="root",
-)
-DOCKER_AUTH_MYSQL: MySQLAuthInfoByTable = MySQLAuthInfoByTable(
-    default=ROOT,
-    by_tables={
-        TEST_TABLE1: ROOT,
-        TEST_TABLE2: ROOT,
-    },
-)
-
-
 class TMySQLClient(MySQLClient):
     GENERATE_RANDOM_DATA_REPEAT_COUNT: int = 10
     GENERATE_RANDOM_DATA_MIN_COUNT: int = 10000
@@ -94,7 +70,7 @@ class TMySQLClient(MySQLClient):
         super().__init__(
             host=host,
             port=port,
-            auth=DOCKER_AUTH_MYSQL,
+            auth=conftest._mysql_info(),
             db=db,
             connect_timeout=connect_timeout,
             **kwargs,

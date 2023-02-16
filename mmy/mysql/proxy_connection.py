@@ -14,6 +14,7 @@ from rich import print
 
 from ..const import SYSTEM_NAME
 from .client_log import client_logger
+from .hosts import MySQLHostBroken
 from .proxy import KeyData
 from .proxy_cursors import DictCursor
 from .proxy_protocol import MmyPacket
@@ -143,7 +144,10 @@ class ProxyConnection(Connection):
         self._writer.write(_b)
         await self._writer.drain()
 
-    async def _read_packet(self, packet_type=MmyPacket):
+    async def _read_packet(
+        self,
+        packet_type=MmyPacket,
+    ):
         """Read an entire "mysql packet" in its entirety from the network
         and return a MysqlPacket type that represents the results.
         """
@@ -160,6 +164,9 @@ class ProxyConnection(Connection):
             client_logger.debug(
                 f"Receive packet: {bytes_to_read}bytes, ID: {packet_number}"
             )
+            if bytes_to_read == 0 and packet_number == 255:
+                client_logger.debug("Received mmy broken host packet")
+                raise MySQLHostBroken
 
             # Outbound and inbound packets are numbered sequentialy, so
             # we increment in both write_packet and read_packet. The count

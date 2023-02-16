@@ -18,6 +18,9 @@ class _Server:
     def __eq__(self, other):
         return self.host == other.host and self.port == other.port
 
+    def address_format(self) -> str:
+        return address_from_server(self)
+
 
 @dataclass
 class Server(_Server):

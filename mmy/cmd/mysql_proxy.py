@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 
 import click
 import httpx
@@ -8,9 +9,32 @@ from rich import print
 
 from mmy.etcd import MySQLEtcdClient, MySQLEtcdData
 from mmy.log import init_log
+from mmy.monitor import MmyMonitor
 from mmy.mysql.hosts import MySQLHosts
 from mmy.mysql.proxy import run_proxy_server
+from mmy.parse import MmyMySQLInfo, MmyYAML, parse_yaml
 from mmy.server import _Server, address_from_server
+
+
+async def monitoring_mysql_servers(
+    mysql_hosts: MySQLHosts,
+    mysql_info: MmyMySQLInfo,
+    etcd: _Server,
+    min_jitter: float = 1.0,
+    max_jitter: float = 10.0,
+):
+    """
+    Monitor MySQL's health and find broken host, update cluster info on etcd.
+    """
+    logger.info("Start monitoring MySQL cluster")
+    monitor: MmyMonitor = MmyMonitor(
+        mysql_hosts=mysql_hosts,
+        auth=mysql_info,
+        etcd=etcd,
+        min_jitter=min_jitter,
+        max_jitter=max_jitter,
+    )
+    await monitor.start_monitor()
 
 
 async def etcd_management(
@@ -72,6 +96,12 @@ async def check_mysql(etcd: _Server):
     help="Timeout of MySQL connection phase",
 )
 @click.option(
+    "--config-path",
+    "-c",
+    type=str,
+    help="Configuration file path for mmy",
+)
+@click.option(
     "--command-timeout",
     default=10,
     type=int,
@@ -84,6 +114,7 @@ def _main(
     etcd_port: int,
     connection_timeout: int,
     command_timeout: int,
+    config_path: str,
 ):
     print("\n")
     print("Hello, this is [bold]mmysql[/bold].")
@@ -107,6 +138,7 @@ def _main(
     )
 
     mysql_hosts = MySQLHosts()
+    mmy_yaml: MmyYAML = parse_yaml(config_path)
 
     async def _p():
         await asyncio.gather(
@@ -120,6 +152,11 @@ def _main(
             etcd_management(
                 mysql_hosts=mysql_hosts,
                 etcd=etcd_server,
+            ),
+            monitoring_mysql_servers(
+                mysql_hosts=mysql_hosts,
+                etcd=etcd_server,
+                mysql_info=mmy_yaml.mysql,
             ),
         )
 

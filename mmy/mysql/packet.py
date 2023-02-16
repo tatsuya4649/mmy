@@ -2,8 +2,11 @@ import asyncio
 import struct
 from dataclasses import dataclass
 
+from loguru import logger
+
 from ..const import SYSTEM_NAME
 from .errcode import MySQLErrorCode
+from .hosts import MySQLHostBroken
 from .proxy_err import MmyError
 
 
@@ -55,3 +58,29 @@ async def send_error_packet_to_client(
     finally:
         client_writer.close()
         raise err
+
+
+@dataclass
+class BrokenHostPacket:
+    pass
+
+
+async def send_host_broken_packet(
+    client_writer: asyncio.StreamWriter,
+):
+    """
+    Non MySQL client/server protocol. This is mmy protocol.
+    Notify what destination of MySQL server is broken to client
+    """
+    try:
+        """
+        * Payload length: 0byte
+        * Sequence ID: 255
+        """
+        _header: bytes = struct.pack(f"<BHB", 0, 0, 255)
+        client_writer.write(_header)
+        await client_writer.drain()
+        logger.debug("Send broken host packet")
+    finally:
+        client_writer.close()
+        raise MySQLHostBroken
