@@ -13,6 +13,7 @@ from ..server import _Server, address_from_server
 from .hosts import MySQLHosts
 from .packet import send_error_packet_to_client
 from .proxy_err import (
+    MmyLocalInfileUnsupportError,
     MmyProtocolError,
     MmyReadTimeout,
     MmyTLSUnsupportError,
@@ -1110,11 +1111,15 @@ class MySQLProxyContext:
                 await self.command_fetch_keydata(packet)
                 return packet
 
+            async def wrap_stoc(packet: MySQLPacket) -> MySQLPacket:
+                await self.check_invalid_request_from_server(packet)
+                return packet
+
             while True:
                 pds: list[MySQLPacketWithDirection] = await asyncio.wait_for(
                     self.only_deliver(
                         ctos_fn=wrap_command_keydata,
-                        stoc_fn=None,
+                        stoc_fn=wrap_stoc,
                     ),
                     timeout=command_timeout,
                 )
@@ -1207,6 +1212,20 @@ class MySQLProxyContext:
                 ),
             )
             raise MmyUnmatchServerError
+
+    async def check_invalid_request_from_server(self, packet: MySQLPacket) -> None:
+        assert self._phase is MySQLConnectionLifecycle.Command
+        if packet.first_payload is None:
+            return
+
+        if packet.first_payload == b"\xFB":  # This request is LOCAL INFILE
+            # mmy protocol error
+            await send_error_packet_to_client(
+                client_writer=self._client_writer,
+                sequence_id=packet.sequence_id,
+                err=MmyLocalInfileUnsupportError("Unsupport LOAD INFILE Request"),
+            )
+        return
 
     @property
     def server(self) -> _Server:
@@ -1400,3 +1419,5 @@ class ProxyServer:
 
         for server in self._servers:
             await server.wait_closed()
+
+        await asyncio.sleep(0.1)

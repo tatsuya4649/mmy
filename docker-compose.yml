@@ -47,6 +47,48 @@ services:
     ports:
       - 10002:3306
 
+  mysql3:
+    container_name: "mmy3"
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: docker
+      MYSQL_PASSWORD: docker
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+      - ./docker/conf:/etc/mysql/conf.d
+    ports:
+      - 10003:3306
+
+  mysql4:
+    container_name: "mmy4"
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: docker
+      MYSQL_PASSWORD: docker
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+      - ./docker/conf:/etc/mysql/conf.d
+    ports:
+      - 10004:3306
+
+  mysql5:
+    container_name: "mmy5"
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: docker
+      MYSQL_PASSWORD: docker
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+      - ./docker/conf:/etc/mysql/conf.d
+    ports:
+      - 10005:3306
+
 networks:
   etcd-network:
     name: etcd-network

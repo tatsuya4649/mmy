@@ -44,6 +44,24 @@ class DockerMySQL(Enum):
         host=ipaddress.ip_address("127.0.0.1"),
         port=10002,
     )
+    MySQL3 = container(
+        service_name="mysql3",
+        container_name="mmy3",
+        host=ipaddress.ip_address("127.0.0.1"),
+        port=10003,
+    )
+    MySQL4 = container(
+        service_name="mysql4",
+        container_name="mmy4",
+        host=ipaddress.ip_address("127.0.0.1"),
+        port=10004,
+    )
+    MySQL5 = container(
+        service_name="mysql5",
+        container_name="mmy5",
+        host=ipaddress.ip_address("127.0.0.1"),
+        port=10005,
+    )
 
 
 TEST_TABLE1: TableName = TableName("user")

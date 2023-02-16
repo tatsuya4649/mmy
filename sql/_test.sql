@@ -45,3 +45,5 @@ BEGIN
 END
 $$
 DELIMITER ;
+
+SET PERSIST local_infile= 1;

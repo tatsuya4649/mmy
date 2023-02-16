@@ -69,6 +69,14 @@ class MmyWriteTimeout(MmyError):
         return MySQLErrorCode.ER_NET_WRITE_ERROR
 
 
+class MmyLocalInfileUnsupportError(MmyProtocolError):
+    def errno(self):
+        return 6
+
+    def mysql_error(self) -> MySQLErrorCode:
+        return MySQLErrorCode.ER_NOT_SUPPORTED_YET
+
+
 from typing import Type
 
 mmy_errmap: dict[int, Type[MmyError]] = {
@@ -78,6 +86,7 @@ mmy_errmap: dict[int, Type[MmyError]] = {
     3: MmyUnmatchServerError,
     4: MmyReadTimeout,
     5: MmyWriteTimeout,
+    6: MmyLocalInfileUnsupportError,
 }
 
 

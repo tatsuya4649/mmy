@@ -15,9 +15,9 @@ from python_on_whales import docker
 from rich import print
 
 from mmy.mysql.hosts import MySQLHosts
-from mmy.mysql.proxy import ProxyServer, create_server
+from mmy.mysql.proxy import ProxyServer
 from mmy.mysql.proxy_connection import ProxyConnection, proxy_connect
-from mmy.mysql.proxy_err import MmyUnmatchServerError
+from mmy.mysql.proxy_err import MmyLocalInfileUnsupportError, MmyUnmatchServerError
 from mmy.server import Server, State, _Server
 
 from .test_mysql import TEST_TABLE1, DockerMySQL, container
@@ -216,6 +216,7 @@ def fix_proxy_connect(key: str, port: int):
         user="root",
         password="root",
         connect_timeout=0.1,
+        local_infile=True,
     )
     return _client
 
@@ -362,6 +363,24 @@ async def test_show_variables(
             assert isinstance(res, list)
             for item in res:
                 assert isinstance(item, dict)
+
+
+@pytest.mark.asyncio
+async def test_load_infile(
+    proxy_server_start,
+):
+    random_key = str(time.time_ns())
+    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            resource_dirs = os.path.join(os.path.dirname(__file__), "resources")
+            resource_user = os.path.join(resource_dirs, "user.csv")
+            with pytest.raises(MmyLocalInfileUnsupportError):
+                await cursor.execute(
+                    key=random_key,
+                    query='LOAD DATA LOCAL INFILE "%s" INTO TABLE user FIELDS TERMINATED BY "," (@1) SET name=@1'
+                    % (resource_user),
+                )
 
 
 @pytest.mark.asyncio
