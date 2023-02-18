@@ -20,7 +20,7 @@ from mmy.mysql.proxy_connection import ProxyConnection, proxy_connect
 from mmy.mysql.proxy_err import MmyLocalInfileUnsupportError, MmyUnmatchServerError
 from mmy.server import Server, State, _Server
 
-from .conftest import TEST_TABLE1
+from ._mysql import TEST_TABLE1
 from .test_mysql import DockerMySQL, container
 
 HOST = "127.0.0.1"
@@ -291,6 +291,45 @@ async def test_insert(
         await connect.commit()
 
 
+count = 10000
+
+
+@pytest.mark.asyncio
+async def test_insert_many(
+    proxy_server_start,
+):
+    import random
+
+    from tqdm import tqdm
+
+    random_key = random.randint(1000000, 10000000)
+    keys = list()
+    for i in tqdm(range(count)):
+        _rk = str(random_key + i)
+        keys.append(_rk)
+        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                res = await cursor.execute(
+                    key=_rk,
+                    query="INSERT INTO %s (id, name) VALUES (%s, %s)"
+                    % (TEST_TABLE1, _rk, _rk),
+                )
+                assert res == 1
+
+            await connect.commit()
+
+        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                await cursor.execute(
+                    key=_rk,
+                    query="SELECT * FROM %s WHERE id=%s" % (TEST_TABLE1, _rk),
+                )
+                res = len(await cursor.fetchall())
+                assert res == 1
+
+
 @pytest.mark.asyncio
 async def test_update(
     proxy_server_start,
@@ -320,6 +359,44 @@ async def test_update(
 
 
 @pytest.mark.asyncio
+async def test_update_many(
+    proxy_server_start,
+):
+    import random
+
+    from tqdm import tqdm
+
+    random_key = random.randint(1000000, 10000000)
+    keys = list()
+    for i in tqdm(range(count)):
+        _rk = str(random_key + i)
+        keys.append(_rk)
+        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                res = await cursor.execute(
+                    key=_rk,
+                    query="INSERT INTO %s (id, name) VALUES (%s, %s)"
+                    % (TEST_TABLE1, _rk, _rk),
+                )
+                assert res == 1
+
+            await connect.commit()
+
+        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+            _random_key = random.randint(1000000, 10000000)
+            _nrk = str(_random_key)
+            cursor = await connect.cursor()
+            async with cursor:
+                await cursor.execute(
+                    key=_rk,
+                    query="UPDATE %s SET name=%s" % (TEST_TABLE1, _nrk),
+                )
+                res = len(await cursor.fetchall())
+                assert res == 1
+
+
+@pytest.mark.asyncio
 async def test_delete(
     proxy_server_start,
 ):
@@ -345,6 +422,39 @@ async def test_delete(
             assert res == 1
 
         await connect.commit()
+
+
+@pytest.mark.asyncio
+async def test_delete_many(
+    proxy_server_start,
+):
+    import random
+
+    from tqdm import tqdm
+
+    random_key = random.randint(1000000, 10000000)
+    selects = list()
+    _rk = str(random_key)
+    async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+        cursor = await connect.cursor()
+        async with cursor:
+            await cursor.execute(
+                key=_rk,
+                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE1, count),
+            )
+            selects.extend(await cursor.fetchall())
+
+    for row in tqdm(selects):
+        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                res = await cursor.execute(
+                    key=_rk,
+                    query="DELETE FROM %s WHERE id=%s" % (TEST_TABLE1, row["id"]),
+                )
+                assert res == 1
+
+            await connect.commit()
 
 
 @pytest.mark.asyncio

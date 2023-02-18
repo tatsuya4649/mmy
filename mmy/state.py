@@ -2,14 +2,29 @@ import asyncio
 
 from rich import print
 
-from .etcd import MySQLEtcdClient, MySQLEtcdData
+from .etcd import EtcdConnectError, MmyEtcdInfo, MySQLEtcdClient, MySQLEtcdData
 from .pool import ServerPool
 from .server import Server, State, state_rich_str
 
 
-async def _state_main():
-    cli = MySQLEtcdClient()
-    data: MySQLEtcdData = await cli.get()
+async def _state_main(
+    etcd_info: MmyEtcdInfo,
+):
+    for etcd in etcd_info.nodes:
+        try:
+            cli = MySQLEtcdClient(
+                host=etcd.host,
+                port=etcd.port,
+            )
+            data: MySQLEtcdData = await cli.get()
+            break
+        except EtcdConnectError:
+            continue
+        except Exception as e:
+            print(type(e))
+    else:
+        # No alive etcd node
+        raise RuntimeError("No alive etcd nodes")
 
     if len(data.nodes) == 0:
         print("[bold]No MySQL nodes...[/bold]")
@@ -69,5 +84,7 @@ async def _state_main():
     pass
 
 
-def state_main():
-    asyncio.run(_state_main())
+def state_main(
+    etcd_info: MmyEtcdInfo,
+):
+    asyncio.run(_state_main(etcd_info))

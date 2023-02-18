@@ -11,3 +11,25 @@ mysql:
     - name: post
       user: root
       password: root
+etcd:
+  nodes:
+    - host: 172.160.0.11
+      port: 2379
+    - host: 172.160.0.12
+      port: 2379
+    - host: 172.160.0.13
+      port: 2379
+    - host: 172.160.0.14
+      port: 2379
+    - host: 172.160.0.15
+      port: 2379
+    - host: 172.160.0.16
+      port: 2379
+    - host: 172.160.0.17
+      port: 2379
+    - host: 172.160.0.18
+      port: 2379
+    - host: 172.160.0.19
+      port: 2379
+    - host: 172.160.0.20
+      port: 2379

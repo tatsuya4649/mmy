@@ -7,7 +7,9 @@ import pytest
 import pytest_asyncio
 from pymysql.err import OperationalError
 from python_on_whales import docker
+from python_on_whales.exceptions import NoSuchContainer
 from rich import print
+from tqdm import tqdm
 
 from mmy.mysql.client import (
     INSERT_ONCE_LIMIT,
@@ -19,7 +21,8 @@ from mmy.mysql.client import (
     _Extra,
 )
 
-from .docker import container
+from ._mysql import TEST_TABLE1, TEST_TABLE2, _mmy_info
+from .docker import DockerStartupError, container
 
 
 class DockerMySQL(Enum):
@@ -55,6 +58,16 @@ class DockerMySQL(Enum):
     )
 
 
+DEFAULT = 5
+
+
+def get_mysql_docker_for_test(count: int = DEFAULT):
+    if count > len(list(DockerMySQL)):
+        raise ValueError
+
+    return list(DockerMySQL)[:count]
+
+
 class TMySQLClient(MySQLClient):
     GENERATE_RANDOM_DATA_REPEAT_COUNT: int = 10
     GENERATE_RANDOM_DATA_MIN_COUNT: int = 10000
@@ -63,15 +76,14 @@ class TMySQLClient(MySQLClient):
         self,
         host="127.0.0.1",
         port=10001,
-        db="test",
         connect_timeout=3,
         **kwargs,
     ):
+        _mmy = _mmy_info()
         super().__init__(
             host=host,
             port=port,
-            auth=conftest._mysql_info(),
-            db=db,
+            auth=_mmy.mysql,
             connect_timeout=connect_timeout,
             **kwargs,
         )
@@ -112,50 +124,93 @@ class TMySQLClient(MySQLClient):
         return container.value.container_name not in [i.name for i in mcs]
 
 
-@pytest_asyncio.fixture(scope="session", autouse=True)
-async def up_mysql():
-    mcs = [i.value.service_name for i in list(DockerMySQL)]
-    _run_containers = docker.compose.ps(mcs)
-    docker_mysqls = [i.value for i in list(DockerMySQL)]
-    _r = [i.name for i in _run_containers]
-    for mysql in docker_mysqls:
-        if not mysql.container_name in _r:
-            docker.compose.up([mysql.service_name], detach=True)
-
-    RETRY_COUNT: int = 10
-    for _ in range(RETRY_COUNT):
-        for mysql in docker_mysqls:
-            print(f'UP "{mysql.service_name}" container')
-            _, port = docker.compose.port(mysql.service_name, 3306)
-
-            try:
-                cli = TMySQLClient(
-                    port=port,
-                )
-                await cli.ping()
-            except OperationalError as e:
-                errcode = e.args[0]
-                # Can't connect to MySQL server on '127.0.0.1'
-                if errcode == 2003:
-                    await asyncio.sleep(10)
-                else:
-                    raise e
-                break
-        else:
-            # OK, PING with all MySQL containers
+async def up_mysql_docker_container(container: DockerMySQL):
+    docker.compose.up(
+        container.value.service_name,
+        detach=True,
+    )
+    RETRY_COUNT: int = 60
+    for _ in tqdm(range(RETRY_COUNT)):
+        try:
+            cli = TMySQLClient(
+                port=container.value.port,
+            )
+            await cli.ping()
             break
-
-        # PING error, retry
-        continue
+        except OperationalError as e:
+            errcode = e.args[0]
+            # Can't connect to MySQL server on '127.0.0.1'
+            if errcode == 2003:
+                await asyncio.sleep(10)
+                # PING error, retry
+                continue
+            else:
+                raise e
     else:
-
-        class DockerStartupError(RuntimeError):
-            pass
-
-        # Reach max retry count
         raise DockerStartupError
+    pass
+
+
+async def up_mysql_docker_containers():
+    for mysql in tqdm(get_mysql_docker_for_test()):
+        await up_mysql_docker_container(mysql)
+
+    return
+
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def fix_up_mysql_docker_containers():
+    print("Setup MySQL docker")
+    for mysql in tqdm(get_mysql_docker_for_test()):
+        await up_mysql_docker_container(mysql)
 
     yield
+
+
+@pytest.fixture
+def fix_down_all_mysql_docker_containers():
+    service_names = [i.value.service_name for i in DockerMySQL]
+    ps = docker.compose.ps(service_names)
+    for ps_info, service_name in zip(tqdm(ps), service_names):
+        if ps_info.state.running is False:
+            raise RuntimeError(f'Already not running: "{service_name}"')
+
+        try:
+            docker.compose.stop(services=[service_name])
+        except NoSuchContainer:
+            continue
+
+        assert ps_info.state.running is False
+
+    yield
+
+
+def down_all_mysql_docker_containers(volumes: bool = False):
+    print("Delete all MySQL docker containers")
+    for container in tqdm(list(DockerMySQL)):
+        container_name: str = container.value.container_name
+        try:
+            docker.stop([container_name])
+        except NoSuchContainer:
+            continue
+
+    if volumes:
+        print("Delete all volumes of MySQL's container")
+        delete_volumes = list()
+        for container in tqdm(list(DockerMySQL)):
+            try:
+                inspect = docker.container.inspect(container_name)
+            except NoSuchContainer:
+                continue
+            assert inspect.state.status == "exited"
+            for mount in inspect.mounts:
+                if mount.type == "volume":
+                    delete_volumes.append(mount.name)
+        docker.system.prune(all=False, volumes=True)
+        for volume in delete_volumes:
+            docker.volume.remove(volume)
+
+    return
 
 
 @pytest_asyncio.fixture(scope="function", autouse=True)

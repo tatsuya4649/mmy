@@ -1,6 +1,6 @@
+import logging
 from typing import Any, Generator
 
-from loguru import logger
 from uhashring import HashRing
 
 from ..ring import MySQLMetaRing, Node
@@ -15,6 +15,7 @@ class MySQLHosts(MySQLMetaRing):
     def __init__(
         self,
     ):
+        self.logger = logging.getLogger(__name__)
         self._ring = HashRing()
         self._address_map: dict[str, State] = dict()
 
@@ -43,12 +44,12 @@ class MySQLHosts(MySQLMetaRing):
             raise RuntimeError("No hosts")
 
         _h = self._ring.get(key)
-        logger.debug(f"Get server from key: {key}")
-        logger.debug(_h)
+        self.logger.debug(f"Get server from key: {key}")
+        self.logger.debug(_h)
         _s = _h["instance"]
 
         if _s.state == State.Broken:
-            logger.debug("Detect MySQL is broken")
+            self.logger.debug("Detect MySQL is broken")
             raise MySQLHostBroken
 
         return _Server(

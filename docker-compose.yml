@@ -2,23 +2,178 @@ version: "3"
 services:
   etcd1:
     build: .
-    ports: [ "12379:12379", "12380:12380" ]
-    command: >-
-      /usr/local/bin/etcd -name etcd1 -data-dir /etcd-data -listen-client-urls http://0.0.0.0:12379 -advertise-client-urls http://0.0.0.0:12379 -listen-peer-urls http://172.16.0.4:12380 -initial-advertise-peer-urls http://172.16.0.4:12380 -initial-cluster etcd1=http://172.16.0.4:12380,etcd2=http://172.16.0.5:12382 -initial-cluster-token tkn -initial-cluster-state new
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd1
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.11:2379
+      -advertise-client-urls http://172.160.0.11:2379
+      -listen-peer-urls http://172.160.0.11:2380
+      -initial-advertise-peer-urls http://172.160.0.11:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
     networks:
       etcd-network:
-        ipv4_address: 172.16.0.4
+        ipv4_address: 172.160.0.11
     mem_limit: 100m
   etcd2:
     build: .
-    ports: [ "12381:12381", "12382:12382" ]
-    command: >-
-      /usr/local/bin/etcd -name etcd2 -data-dir /etcd-data -listen-client-urls http://0.0.0.0:12381 -advertise-client-urls http://0.0.0.0:12381 -listen-peer-urls http://172.16.0.5:12382 -initial-advertise-peer-urls http://172.16.0.5:12382 -initial-cluster etcd1=http://172.16.0.4:12380,etcd2=http://172.16.0.5:12382 -initial-cluster-token tkn -initial-cluster-state new
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd2
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.12:2379
+      -advertise-client-urls http://172.160.0.12:2379
+      -listen-peer-urls http://172.160.0.12:2380
+      -initial-advertise-peer-urls http://172.160.0.12:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
     networks:
       etcd-network:
-        ipv4_address: 172.16.0.5
+        ipv4_address: 172.160.0.12
     mem_limit: 100m
-
+  etcd3:
+    build: .
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd3
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.13:2379
+      -advertise-client-urls http://172.160.0.13:2379
+      -listen-peer-urls http://172.160.0.13:2380
+      -initial-advertise-peer-urls http://172.160.0.13:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.13
+    mem_limit: 100m
+  etcd4:
+    build: .
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd4
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.14:2379
+      -advertise-client-urls http://172.160.0.14:2379
+      -listen-peer-urls http://172.160.0.14:2380
+      -initial-advertise-peer-urls http://172.160.0.14:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.14
+    mem_limit: 100m
+  etcd5:
+    build: .
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd5
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.15:2379
+      -advertise-client-urls http://172.160.0.15:2379
+      -listen-peer-urls http://172.160.0.15:2380
+      -initial-advertise-peer-urls http://172.160.0.15:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.15
+    mem_limit: 100m
+  etcd6:
+    build: .
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd6
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.16:2379
+      -advertise-client-urls http://172.160.0.16:2379
+      -listen-peer-urls http://172.160.0.16:2380
+      -initial-advertise-peer-urls http://172.160.0.16:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.16
+    mem_limit: 100m
+  etcd7:
+    build: .
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd7
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.17:2379
+      -advertise-client-urls http://172.160.0.17:2379
+      -listen-peer-urls http://172.160.0.17:2380
+      -initial-advertise-peer-urls http://172.160.0.17:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.17
+    mem_limit: 100m
+  etcd8:
+    build: .
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd8
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.18:2379
+      -advertise-client-urls http://172.160.0.18:2379
+      -listen-peer-urls http://172.160.0.18:2380
+      -initial-advertise-peer-urls http://172.160.0.18:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.18
+    mem_limit: 100m
+  etcd9:
+    build: .
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd9
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.19:2379
+      -advertise-client-urls http://172.160.0.19:2379
+      -listen-peer-urls http://172.160.0.19:2380
+      -initial-advertise-peer-urls http://172.160.0.19:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.19
+    mem_limit: 100m
+  etcd10:
+    build: .
+    volumes:
+      - ./docker/conf/etcd:/etc/etcd
+    command: |-
+      /usr/local/bin/etcd
+      -name etcd10
+      -data-dir /etcd-data
+      -listen-client-urls http://172.160.0.20:2379
+      -advertise-client-urls http://172.160.0.20:2379
+      -listen-peer-urls http://172.160.0.20:2380
+      -initial-advertise-peer-urls http://172.160.0.20:2380
+      -initial-cluster etcd1=http://172.160.0.11:2380,etcd2=http://172.160.0.12:2380,etcd3=http://172.160.0.13:2380,etcd4=http://172.160.0.14:2380,etcd5=http://172.160.0.15:2380,etcd6=http://172.160.0.16:2380,etcd7=http://172.160.0.17:2380,etcd8=http://172.160.0.18:2380,etcd9=http://172.160.0.19:2380,etcd10=http://172.160.0.20:2380
+      -initial-cluster-token tkn
+      -initial-cluster-state new
+    networks:
+      etcd-network:
+        ipv4_address: 172.160.0.20
+    volumes:
+      - ./docker/etcd:/etc/etcd
+    mem_limit: 100m
   mysql1:
     container_name: "mmy1"
     image: mysql:8
@@ -29,7 +184,7 @@ services:
       MYSQL_PASSWORD: docker
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
-      - ./docker/conf:/etc/mysql/conf.d
+      - ./docker/conf/mysql:/etc/mysql/conf.d
     ports:
       - 10001:3306
 
@@ -43,7 +198,7 @@ services:
       MYSQL_PASSWORD: docker
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
-      - ./docker/conf:/etc/mysql/conf.d
+      - ./docker/conf/mysql:/etc/mysql/conf.d
     ports:
       - 10002:3306
 
@@ -57,7 +212,7 @@ services:
       MYSQL_PASSWORD: docker
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
-      - ./docker/conf:/etc/mysql/conf.d
+      - ./docker/conf/mysql:/etc/mysql/conf.d
     ports:
       - 10003:3306
 
@@ -71,7 +226,7 @@ services:
       MYSQL_PASSWORD: docker
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
-      - ./docker/conf:/etc/mysql/conf.d
+      - ./docker/conf/mysql:/etc/mysql/conf.d
     ports:
       - 10004:3306
 
@@ -85,7 +240,7 @@ services:
       MYSQL_PASSWORD: docker
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
-      - ./docker/conf:/etc/mysql/conf.d
+      - ./docker/conf/mysql:/etc/mysql/conf.d
     ports:
       - 10005:3306
 
@@ -95,4 +250,4 @@ networks:
     ipam:
       driver: default
       config:
-        - subnet: 172.16.0.0/24
+        - subnet: 172.160.0.0/24

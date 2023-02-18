@@ -1,26 +1,20 @@
 import asyncio
 import ipaddress
+import logging
 from cmd import Cmd
 
 import click
-from loguru import logger
 from rich import print
 
-from mmy.etcd import MySQLEtcdClient, MySQLEtcdNotFoundNode
-from mmy.log import init_log
-from mmy.mysql.add import _add_main
+from mmy.etcd import MmyEtcdInfo, MySQLEtcdClient, MySQLEtcdNotFoundNode
+from mmy.mysql.add import MySQLAdder
+from mmy.mysql.client import MmyMySQLInfo
+from mmy.mysql.delete import MySQLDeleter
+from mmy.parse import MmyYAML, parse_yaml
 from mmy.server import _Server, address_from_server
 from mmy.state import state_main
 
-
-async def _delete_main(server: _Server):
-    try:
-        logger.info("Delete node: %s..." % (address_from_server(server)))
-        etcd = MySQLEtcdClient()
-        await etcd.delete_node(server)
-        logger.info("Done !")
-    except MySQLEtcdNotFoundNode:
-        logger.error("Not found this node on etcd")
+logger = logging.getLogger(__name__)
 
 
 def _parse_server(line: str) -> _Server:
@@ -33,10 +27,18 @@ def _parse_server(line: str) -> _Server:
     return _s
 
 
-def delete_main(line: str):
+def delete_main(
+    line: str,
+    mysql_info: MmyMySQLInfo,
+    etcd_info: MmyEtcdInfo,
+):
     try:
         _s = _parse_server(line)
-        asyncio.run(_delete_main(_s))
+        deleter = MySQLDeleter(
+            mysql_info=mysql_info,
+            etcd_info=etcd_info,
+        )
+        asyncio.run(deleter.do(_s))
     except ValueError as e:
         logger.error("IP address error: %s" % (e))
         print("[bold]Try agin[/bold]")
@@ -62,10 +64,18 @@ class APIResponseError(RuntimeError):
     pass
 
 
-def add_main(line: str):
+def add_main(
+    line: str,
+    mysql_info: MmyMySQLInfo,
+    etcd_info: MmyEtcdInfo,
+):
     try:
         _s = _parse_server(line)
-        asyncio.run(_add_main(_s))
+        adder: MySQLAdder = MySQLAdder(
+            mysql_info=mysql_info,
+            etcd_info=etcd_info,
+        )
+        asyncio.run(adder.do(_s))
     except ValueError as e:
         logger.error("IP address error: %s" % (e))
         print("[bold]Try agin[/bold]")
@@ -76,25 +86,35 @@ def add_main(line: str):
 class MySQLCmd(Cmd):
     prompt = "mysql) "
 
-    def __init__(self):
+    def __init__(
+        self,
+        mysql_info: MmyMySQLInfo,
+        etcd_info: MmyEtcdInfo,
+    ):
         super().__init__()
+        self._mysql_info: MmyMySQLInfo = mysql_info
+        self._etcd_info: MmyEtcdInfo = etcd_info
 
     def do_state(self, line: str):
-        state_main()
+        state_main(self._etcd_info)
 
     def help_state(self):
         print("Show MySQL cluster state")
 
     # About add
     def do_add(self, line: str):
-        add_main(line)
+        add_main(line, self._mysql_info, self._etcd_info)
 
     def help_add(self):
         print("Add new MySQL node into it's cluster")
 
     # About delete
     def do_delete(self, line: str):
-        delete_main(line)
+        delete_main(
+            line=line,
+            mysql_info=self._mysql_info,
+            etcd_info=self._etcd_info,
+        )
 
     def help_delete(self):
         print("Delete MySQL node from it's cluster")
@@ -109,14 +129,25 @@ class MySQLCmd(Cmd):
 
 
 @click.command()
-def cli():
-    init_log()
+@click.argument(
+    "config_path",
+    type=click.Path(exists=True),
+)
+def cli(
+    config_path,
+):
     """
 
     MySQL cluster controller with etcd.
 
+    CONFIG_PATH: YAML file path included MySQL auth info.
+
     """
-    cmd = MySQLCmd()
+    mmy_yaml: MmyYAML = parse_yaml(config_path)
+    cmd = MySQLCmd(
+        mysql_info=mmy_yaml.mysql,
+        etcd_info=mmy_yaml.etcd,
+    )
     cmd.cmdloop()
 
 

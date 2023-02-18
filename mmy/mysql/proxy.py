@@ -1,24 +1,20 @@
 import asyncio
+import logging
 import socketserver
 import struct
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Callable, Coroutine, TypeAlias
 
-from loguru import logger
 from rich import print
 
 from ..const import SYSTEM_NAME
 from ..server import _Server, address_from_server
 from .hosts import MySQLHostBroken, MySQLHosts
 from .packet import send_error_packet_to_client, send_host_broken_packet
-from .proxy_err import (
-    MmyLocalInfileUnsupportError,
-    MmyProtocolError,
-    MmyReadTimeout,
-    MmyTLSUnsupportError,
-    MmyUnmatchServerError,
-)
+from .proxy_err import (MmyLocalInfileUnsupportError, MmyProtocolError,
+                        MmyReadTimeout, MmyTLSUnsupportError,
+                        MmyUnmatchServerError)
 
 PROTOCOL_ID: bytes = b"_MMY"
 
@@ -181,21 +177,6 @@ FromToHandler: TypeAlias = Callable[
 ]
 
 
-def log_debug_direction(d: MySQLProxyDirection):
-    def _log_debug_direction(asyn):
-        async def _wlog_debug_direction(*args, **kwargs):
-            if d is MySQLProxyDirection.CtoS:
-                logger.debug(f"Server <== Client")
-            else:
-                logger.debug(f"Server ==> Client")
-
-            return await asyn(*args, **kwargs)
-
-        return _wlog_debug_direction
-
-    return _log_debug_direction
-
-
 class CapabilitiesFlags(Enum):
     CLIENT_LONG_PASSWORD = 1 << 0
     CLIENT_FOUND_ROWS = 1 << 1
@@ -291,6 +272,26 @@ class MySQLAuthPlugin(Enum):
     caching_sha2_password = b"caching_sha2_password"
 
 
+def log_debug_direction(d: MySQLProxyDirection):
+    def _log_debug_direction(asyn):
+        async def _wlog_debug_direction(*args, **kwargs):
+            self: MySQLProxyContext = args[0]
+            assert isinstance(self, MySQLProxyContext) is True
+            if d is MySQLProxyDirection.CtoS:
+                logger.debug(f"Server <== Client")
+            else:
+                logger.debug(f"Server ==> Client")
+
+            return await asyn(*args, **kwargs)
+
+        return _wlog_debug_direction
+
+    return _log_debug_direction
+
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
 class MySQLProxyContext:
     def __init__(
         self,
@@ -298,6 +299,7 @@ class MySQLProxyContext:
         client_writer: asyncio.StreamWriter,
         mysql_hosts: MySQLHosts,
     ):
+        super().__init__()
         self._phase: MySQLConnectionLifecycle = MySQLConnectionLifecycle.Connetion
         self._client_capabilities: CapabilitiesFlagsSet | None = None
         self._server_capabilities: CapabilitiesFlagsSet | None = None
@@ -401,7 +403,7 @@ class MySQLProxyContext:
             return "."
 
         try:
-            logger.debug("packet length:", len(data))
+            logger.debug("packet length: %d", len(data))
             for i in range(1, 7):
                 f = sys._getframe(i)
                 logger.debug(
@@ -1298,7 +1300,7 @@ async def _proxy_handler(
     connection_timeout: int,
     command_timeout: int,
 ):
-    logger.debug(f"Proxy handler")
+    logger = logging.getLogger(MySQLProxyContext.__name__)
     try:
         """
         This function is outside the range of MySQL Client/Server Protocol.
@@ -1308,6 +1310,8 @@ async def _proxy_handler(
             client_writer=client_writer,
             mysql_hosts=mysql_hosts,
         )
+        logger.debug(f"Proxy handler")
+
         try:
             await ctx.initial_fetch_keydata()
         except asyncio.TimeoutError:
@@ -1388,6 +1392,7 @@ async def create_server(
 
 async def run_proxy_server(*args, **kwargs):
     server: socketserver.BaseServer = await create_server(*args, **kwargs)
+    logger = logging.getLogger(__name__)
     logger.info("Start proxy")
     async with server:
         await server.serve_forever()

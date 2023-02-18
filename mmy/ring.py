@@ -1,23 +1,23 @@
 import bisect
 import copy
 import hashlib
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Coroutine, NewType
 
-from loguru import logger
 from uhashring import HashRing
 
 from .mysql.client import (
+    MmyMySQLInfo,
     MySQLAuthInfoByTable,
     MySQLClient,
     MySQLColumns,
     MySQLFetchAll,
     TableName,
 )
-from .server import _Server, address_from_server
-
-_Point = NewType("_Point", str)
+from .mysql.sql import SQLPoint, _Point, _SQLPoint
+from .server import _Server
 
 
 @dataclass
@@ -31,17 +31,39 @@ class Point:
     point: _Point
     index: int
 
+    def __eq__(self, other):
+        return (
+            self.have_node == other.have_node
+            and self.point == other.point
+            and self.index == other.index
+        )
+
+    def __gt__(self, other):
+        return self.point > other.point
+
+    def __ge__(self, other):
+        return self.point >= other.point
+
+    def __lt__(self, other):
+        return not self.__ge__(other)
+
+    def __le__(self, other):
+        return not self.__gt__(other)
+
 
 @dataclass
 class Md:
     node: Node
-    point: _Point
+    start_point: _Point
+    start_equal: bool
+    end_point: _Point
+    end_equal: bool
 
 
 @dataclass
 class MoveData:
     _from: Md
-    _to: Md
+    _to: Node
 
 
 class RingHandler(ABC):
@@ -76,6 +98,36 @@ class MDP(MoveData):
     end: _Point
 
 
+class RingNoMoveYet(RuntimeError):
+    """
+    Not have moved data
+    """
+
+
+@dataclass
+class MovedTableData:
+    tablename: TableName
+    moved_count: int
+
+
+@dataclass
+class MovedData:
+    tables: list[MovedTableData]
+
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def reset_from_to_parameter(func):
+    async def _wrap(*args, **kwargs):
+        ring: Ring = args[0]
+        assert isinstance(ring, Ring) is True
+        ring._from_to = list()
+        return await func(*args, **kwargs)
+
+    return _wrap
+
+
 class Ring(RingHandler):
     def __init__(
         self,
@@ -83,21 +135,32 @@ class Ring(RingHandler):
         default_vnodes: int = 80,
     ):
         self._default_vnodes = default_vnodes
+        self._node_hash: dict[str, Node] = dict()
         nodes = dict()
         for _in in init_nodes:
-            nodes[self.nodename_from_node(_in)] = {
+            _nodename = self.nodename_from_node(_in)
+            nodes[_nodename] = {
                 "instance": _in,
                 "vnodes": self._default_vnodes,
             }
+            self._node_hash[_nodename] = _in
         self._hr = HashRing(
             nodes=nodes,
             hash_fn=lambda key: hashlib.md5(str(key).encode("utf-8")).hexdigest(),
         )
-        self._node_hash: dict[str, Node] = dict()
         self._from_to: list[MDP] | None = None
 
+    def __len__(self) -> int:
+        return len(self._node_hash)
+
     def nodename_from_node(self, node: Node) -> str:
-        return str(node.host)
+        return f"%s:%d" % (str(node.host), node.port)
+
+    def ring_node_count(self) -> int:
+        return self._hr.size
+
+    def ring_points(self):
+        return self._hr.get_points()
 
     def logring(self):
         DELIMITER_COUNT = 50
@@ -116,11 +179,9 @@ class Ring(RingHandler):
             logger.info(f"{NODEMARK} {nodename} -- {point}({len(str(point))})")
 
         logger.info(DELIMITER)
-        pass
 
-    async def add(self, node: Node) -> Coroutine[None, None, None]:
-        async def _emp():
-            return
+    @reset_from_to_parameter
+    async def add(self, node: Node) -> list[Coroutine[None, None, MovedData | None]]:
 
         points: list[tuple[str, str]] = self._hr.get_points()
         _nodename: str = self.nodename_from_node(node)
@@ -138,8 +199,7 @@ class Ring(RingHandler):
         self._node_hash[_nodename] = node
         if len(points) == 0:
             logger.info(f"Add first node {node.host}:{node.port} as {_nodename} ")
-
-            return _emp()
+            return []
 
         added_items: list[str] = list()
         added_points: list[tuple[str, str]] = self._hr.get_points()
@@ -153,6 +213,15 @@ class Ring(RingHandler):
         def get_add_point() -> Point:
             _index = added_keys.index(item)
             point, _ = added_points[_index]
+            return Point(
+                have_node=node,
+                point=_Point(point),
+                index=_index,
+            )
+
+        def get_prev_add_point() -> Point:
+            _index = added_keys.index(item)
+            point, _ = added_points[_index - 1]
             return Point(
                 have_node=node,
                 point=_Point(point),
@@ -185,33 +254,82 @@ class Ring(RingHandler):
             )
             return pp
 
-        logger.info(f"Add node {node.host}:{node.port} as {_nodename} ")
+        logger.info(f"Add node {_nodename} ")
         self._from_to = list()
+        _cos: list[Coroutine[None, None, MovedData | None]] = list()
         for item in added_items:
-            p = get_add_point()
-            np = get_next_point()
-            pp = get_prev_point()
+            ap = get_add_point()  # added point
+            np = get_next_point()  # next point
+            pp = get_prev_point()  # prev point
+            pap: Point = get_prev_add_point()  # prev added point
+            print("000000000000000")
+            print("PP  ", pp.point)
+            print("AP  ", ap.point)
+            print("NP  ", np.point)
+            print("PAP ", pap.point)
+            """
+
+            A: Added node
+            |> : Greater than
+            =| : Less than or equal
+
+            Ex1.
+
+            Before:
+
+              prev                          next
+                * --------------------------- *
+                |>------------=|
+                        Owner of "next" node.
+                        |
+                        |  Move to A
+                        |______
+                               |
+            After:             |
+
+              prev             A             next
+                * -------------*-------------- *
+
+            Ex2.
+
+            Before:
+
+              prev                          next
+                * --------------------------- *
+                |>------------=|
+                        Owner of "next" node.
+                        |
+                        |  Move to A
+                        |______
+                               |
+            After:             |
+
+              prev      A       A            next
+                * ------*-------*------------- *
+            """
 
             _from: Md = Md(
                 node=np.have_node,
-                point=pp.point,
+                start_point=pp.point if pap <= pp else pap.point,
+                start_equal=False,
+                end_point=ap.point,
+                end_equal=True,
             )
-            _to: Md = Md(
-                node=p.have_node,
-                point=p.point,
-            )
+            print(f"{_from.start_point}~{_from.end_point}")
+            _to: Node = ap.have_node
             mdp: MDP = MDP(
                 _from=_from,
                 _to=_to,
                 start=pp.point,
-                end=p.point,
+                end=ap.point,
             )
             self._from_to.append(mdp)
-            return self._move(mdp)
+            _cos.append(self._move(mdp))
 
-        return _emp()
+        return _cos
 
-    async def delete(self, node: Node):
+    @reset_from_to_parameter
+    async def delete(self, node: Node) -> list[Coroutine[None, None, MovedData | None]]:
         points: list[tuple[str, str]] = self._hr.get_points()
         items = list()
         _nodename: str = self.nodename_from_node(node)
@@ -222,9 +340,14 @@ class Ring(RingHandler):
         keys = self._hr._keys
         keys.sort()
 
-        _prev_hr = copy.deepcopy(self._hr)
         del self._node_hash[_nodename]
-        self._hr.remove_node(node)
+        self._hr.remove_node(_nodename)
+
+        if len(self) > 0 and len(items) == 0:
+            raise RuntimeError("Unexpected error. Must have Deleted items...")
+        elif len(self) == 0:
+            # No node in this ring. So, do not anything.
+            return []
 
         deleted_points: list[tuple[str, str]] = self._hr.get_points()
         deleted_keys: list[str] = self._hr._keys
@@ -233,6 +356,15 @@ class Ring(RingHandler):
         def get_delete_point() -> Point:
             _index = keys.index(item)
             point, _ = points[_index]
+            return Point(
+                have_node=node,
+                point=_Point(point),
+                index=_index,
+            )
+
+        def get_prev_delete_point() -> Point:
+            _index = keys.index(item)
+            point, _ = points[_index - 1]
             return Point(
                 have_node=node,
                 point=_Point(point),
@@ -265,44 +397,96 @@ class Ring(RingHandler):
             )
             return pp
 
-        logger.info(f"Delete node: {node}")
+        logger.info(f"Delete node: {_nodename}")
+        self._from_to = list()
+        _cos: list[Coroutine[None, None, MovedData | None]] = list()
+
         for item in items:
-            p = get_delete_point()
-            np = get_next_point()
-            pp = get_prev_point()
+            dp: Point = get_delete_point()
+            np: Point = get_next_point()
+            pp: Point = get_prev_point()
+            pdp: Point = get_prev_delete_point()
+
+            """
+
+            D : Deleted node
+            |> : Greater than
+            =| : Less than or equal
+
+        Ex1.
+
+            Before:
+
+                  prev      D       D     D      next
+                    * ------*-------*-----*------- *
+                    |>-------------------=|
+                            Owner of "D" node.
+                            |
+                            |       Move to next
+                            |____________________
+                                                 |
+            After:                               |
+
+                  prev                          next
+                    * --------------------------- *
+
+
+        Ex2.
+
+            Before:
+
+              prev             D            next
+                * -------------*------------- *
+                |>------------=|
+                        Owner of "D" node.
+                        |
+                        |       Move to next
+                        |_____________________
+                                              |
+            After:                            |
+
+              prev                          next
+                * --------------------------- *
+
+            """
 
             _from: Md = Md(
-                node=p.have_node,
-                point=pp.point,
+                node=dp.have_node,
+                start_point=pp.point if pdp <= pp else pdp.point,
+                start_equal=False,
+                end_point=dp.point,
+                end_equal=True,
             )
-            _to: Md = Md(
-                node=np.have_node,
-                point=p.point,
-            )
+            _to: Node = np.have_node
 
             mdp: MDP = MDP(
                 _from=_from,
                 _to=_to,
                 start=pp.point,
-                end=p.point,
+                end=dp.point,
             )
-            await self._move(mdp)
+            self._from_to.append(mdp)
+            _cos.append(self._move(mdp))
 
-    async def _move(self, mdp: MDP):
+        return _cos
+
+    async def _move(self, mdp: MDP) -> MovedData | None:
         _from: Md = mdp._from
-        _to: Md = mdp._to
+        _to: Node = mdp._to
         start: _Point = mdp.start
         end: _Point = mdp.end
-        if _from.node.host == _to.node.host:
+        if _from.node == _to:
             logger.info("From node and To node is same")
-            return
+            return MovedData(
+                tables=[],
+            )
 
-        _from_address: str = "%s:%d" % (_from.node.host, _from.node.port)
-        _to_address: str = "%s:%d" % (_to.node.host, _to.node.port)
-        logger.info(f"Move data: {_from_address} ==> {_to_address} ")
+        logger.info(
+            f"Move data: {_from.node.address_format()} ==> {_to.address_format()} "
+        )
         logger.info(f"  Start: {start}")
         logger.info(f"  End:   {end}")
-        await self.move(
+        return await self.move(
             MoveData(
                 _from=_from,
                 _to=_to,
@@ -312,15 +496,12 @@ class Ring(RingHandler):
     @property
     def from_to_data(self) -> list[MDP]:
         if self._from_to is None:
-            raise RuntimeError("No data moved yet")
+            raise RingNoMoveYet("No data moved yet")
         return self._from_to
 
 
 class MySQLMetaRing:
     RING_VNODES: int = 80
-
-    def nodename_from_node(self, node: Node) -> str:
-        return f"%s:%d" % (str(node.host), node.port)
 
 
 class MySQLRing(
@@ -329,49 +510,62 @@ class MySQLRing(
 ):
     def __init__(
         self,
-        db: str,
-        auth: MySQLAuthInfoByTable,
+        mysql_info: MmyMySQLInfo,
         **kwargs,
     ):
+        if "default_vnodes" in kwargs:
+            del kwargs["default_vnodes"]
         super().__init__(
+            default_vnodes=self.RING_VNODES,
             **kwargs,
         )
-        self._db = db
-        self._auth = auth
+        self._mysql_info: MmyMySQLInfo = mysql_info
 
     def table_names(self):
-        return list(self._auth.by_tables.keys())
+        _auth_by_tables: MySQLAuthInfoByTable = self._mysql_info.auth_by_tables()
+        return list(_auth_by_tables.tables.keys())
 
-    async def move(self, data: MoveData):
+    async def move(self, data: MoveData) -> MovedData:
         logger.info("Move MySQL data")
         _from: Md = data._from
-        _to: Md = data._to
+        _to: Node = data._to
 
         _from_client = MySQLClient(
-            db=self._db,
             host=_from.node.host,
             port=_from.node.port,
-            auth=self._auth,
+            auth=self._mysql_info,
         )
         _to_client = MySQLClient(
-            db=self._db,
-            host=_to.node.host,
-            port=_to.node.port,
-            auth=self._auth,
+            host=_to.host,
+            port=_to.port,
+            auth=self._mysql_info,
         )
+        assert _from.node != _to
         await _from_client.ping()
         await _to_client.ping()
+        _tables: list[MovedTableData] = list()
         for table in self.table_names():
             tablename: TableName = TableName(table)
             _from_data = await _from_client.consistent_hashing_select(
                 table=tablename,
-                start=str(_from.point),
-                end=str(_to.point),
+                start=SQLPoint(
+                    point=_from.start_point,
+                    equal=False,
+                    greater=True,
+                    less=False,
+                ),
+                end=SQLPoint(
+                    point=_from.end_point,
+                    equal=True,
+                    greater=False,
+                    less=True,
+                ),
             )
             columns: list[MySQLColumns] = await _from_client.columns_info(tablename)
             excluded_columns: list[
                 MySQLColumns
             ] = _from_client.exclude_auto_increment_columns(columns)
+
             async for frag in _from_data:
                 modified_frag: MySQLFetchAll = _from_client.exclude_data_by_columns(
                     excluded_columns, frag
@@ -380,39 +574,161 @@ class MySQLRing(
                     table=tablename,
                     datas=modified_frag,
                 )
+                _tables.append(
+                    MovedTableData(
+                        tablename=tablename,
+                        moved_count=len(frag),
+                    )
+                )
+
+        _moved: MovedData = MovedData(
+            tables=_tables,
+        )
+        return _moved
+
+    async def _delete_data_from_node(self, node: Node, start: SQLPoint, end: SQLPoint):
+        cli = MySQLClient(
+            host=node.host,
+            port=node.port,
+            auth=self._mysql_info,
+        )
+        for table in self.table_names():
+            await cli.consistent_hashing_delete(
+                table=table,
+                start=start,
+                end=end,
+            )
 
     async def delete_from_old_nodes(self, new_node: Node):
+        """
+
+        Before added node:
+
+        A                 B
+        *-----------------*
+        |>---------------=|
+                 This range's ower is B node.
+
+        After added node:
+
+             Added node
+        A        |        B
+        *--------*--------*
+        |>------=|
+             |
+             |__ This range's owner is added node.
+                 So, The data of this range in B node is no longer needed.
+
+        """
         _ftd: list[MDP] = self.from_to_data
+
+        logger.info(f"Move data points: {len(_ftd)}")
 
         for item in _ftd:
             from_node = item._from.node
-            to_node = item._to.node
+            to_node = item._to
             if from_node == new_node:
                 raise RuntimeError(
-                    f"From node({address_from_server(from_node)}) must not be new node({address_from_server(new_node)})"
+                    f"From node({from_node.address_format()}) must not be new node({new_node.address_format()})"
                 )
-            if not (to_node == new_node):
+            if to_node != new_node:
                 raise RuntimeError(
-                    f"To node({address_from_server(to_node)}) must be new node({address_from_server(new_node)})"
+                    f"To node({to_node.address_format()}) must be new node({new_node.address_format()})"
                 )
 
-            logger.info(f"Old data delete from {address_from_server(from_node)}")
+            logger.info(f"Old data delete from {from_node.address_format()}")
             logger.info(f"  Start: {item.start}")
             logger.info(f"  End:   {item.end}")
-            _from_client = MySQLClient(
-                db=self._db,
-                host=from_node.host,
-                port=from_node.port,
-                auth=self._auth,
+            await self._delete_data_from_node(
+                node=from_node,
+                start=SQLPoint(
+                    point=item.start,
+                    equal=False,
+                    greater=True,
+                    less=False,
+                ),
+                end=SQLPoint(
+                    point=item.end,
+                    equal=True,
+                    greater=False,
+                    less=True,
+                ),
             )
-            for table in self.table_names():
-                await _from_client.consistent_hashing_delete(
-                    table=table,
-                    start=item.start,
-                    end=item.end,
-                )
 
         return
+
+    async def delete_data_from_deleted_node(self, node: Node):
+        _ftd: list[MDP] = self.from_to_data
+        logger.info(f"Move data points: {len(_ftd)}")
+        assert len(_ftd) == self._default_vnodes
+
+        for item in _ftd:
+            from_node: Node = item._from.node
+            to_node: Node = item._to
+            """
+
+                Deleted node
+            A        |        B
+            *--------*--------*
+            |>------=| 
+                 |
+                 |__ This range's owner is deleted node.
+
+                     The data of range that is from *(A) to *(Deleted node) is moved to "B" node.
+
+            """
+            if from_node == node:
+                """
+
+                from_node is A node in above comment
+
+                """
+                raise RuntimeError(
+                    f"From node({from_node.address_format()}) must not be deleted node({node.address_format()})"
+                )
+            if to_node != node:
+                """
+
+                to_node is B node in above comment
+
+                """
+                raise RuntimeError(
+                    f"To node({to_node.address_format()}) must not be deleted node({node.address_format()})"
+                )
+
+            logger.info(f"Old data delete from {from_node.address_format()}")
+            logger.info(f"  Start: {item.start}")
+            logger.info(f"  End:   {item.end}")
+            await self._delete_data_from_node(
+                node=from_node,
+                start=SQLPoint(
+                    point=item.start,
+                    equal=False,
+                    greater=True,
+                    less=False,
+                ),
+                end=SQLPoint(
+                    point=item.end,
+                    equal=True,
+                    greater=False,
+                    less=True,
+                ),
+            )
+
+        return
+
+    async def _optimize_table(self, node: Node):
+        for table in self.table_names():
+            _from_client = MySQLClient(
+                host=node.host,
+                port=node.port,
+                auth=self._mysql_info,
+            )
+            await _from_client.optimize_table(
+                table=table,
+            )
+            logger.info(f'Optimize MySQL table "{table}" on : {node.address_format()}')
+        logger.info(f"Optimize MySQL node: {node.address_format()}")
 
     async def optimize_table_old_nodes(self, new_node: Node):
         _ftd: list[MDP] = self.from_to_data
@@ -425,14 +741,10 @@ class MySQLRing(
         for from_node in _from_nodes:
             if from_node == new_node:
                 raise RuntimeError(
-                    f"From node({address_from_server(from_node)}) must not be new node({address_from_server(new_node)})"
+                    f"From node({from_node.address_format()}) must not be new node({new_node.address_format()})"
                 )
 
-            _from_client = MySQLClient(
-                db=self._db,
-                host=from_node.host,
-                port=from_node.port,
-                auth=self._auth,
-            )
-            await _from_client.optimize_table()
-            logger.info(f"Optimize MySQL node: {address_from_server(from_node)}")
+            await self._optimize_table(from_node)
+
+    async def optimize_table_deleted_node(self, node: Node):
+        await self._optimize_table(node)

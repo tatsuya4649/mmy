@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from enum import Enum, auto
 from typing import Coroutine
 
 from rich import print
@@ -13,20 +12,20 @@ from mmy.etcd import (
     MySQLEtcdData,
     MySQLEtcdDuplicateNode,
 )
-from mmy.mysql.client import MmyMySQLInfo, MySQLClient
-from mmy.ring import MySQLRing, Node, RingNoMoveYet
+from mmy.mysql.client import MmyMySQLInfo, MySQLClient, TableName
+from mmy.ring import MovedData, MySQLRing, Node, RingNoMoveYet
 from mmy.server import State, _Server, address_from_server, state_rich_str
+
+from .add import PingType
 
 logger = logging.getLogger(__name__)
 
 
-class PingType(Enum):
-    OnlyTargetServer = auto()
-    AllServer = auto()
-    NonPing = auto()
+class MySQLDeleterNoServer(ValueError):
+    pass
 
 
-class MySQLAdder:
+class MySQLDeleter:
     def __init__(
         self,
         mysql_info: MmyMySQLInfo,
@@ -39,6 +38,7 @@ class MySQLAdder:
         self,
         server: _Server,
         ping_type: PingType = PingType.AllServer,
+        delete_data: bool = True,
     ):
         async def ping_mysql(_s: _Server):
             try:
@@ -70,19 +70,23 @@ class MySQLAdder:
                         lambda x: Node(host=x.host, port=x.port), now_data.nodes
                     ),
                 )
-                prev_nodes_length: int = len(_ring)
                 node = Node(
                     host=server.host,
                     port=server.port,
                 )
-                moves: list[Coroutine[None, None, None]] = await _ring.add(
+                prev_nodes_length: int = len(_ring)
+                moves: list[Coroutine[None, None, None]] = await _ring.delete(
                     node=node,
                 )
                 new_nodes_length: int = len(_ring)
+                if new_nodes_length == 0:
+                    raise MySQLDeleterNoServer(
+                        "If delete this server, there won't be one left"
+                    )
                 logger.info(f"Moving data fragments count: {len(moves)}")
                 logger.info(f"Prev nodes count: {prev_nodes_length}")
                 logger.info(f"New nodes count: {new_nodes_length}")
-                assert new_nodes_length == prev_nodes_length + 1
+                assert new_nodes_length == prev_nodes_length - 1
 
                 match ping_type:
                     case PingType.OnlyTargetServer:
@@ -111,36 +115,38 @@ class MySQLAdder:
                     case _:
                         raise ValueError
 
-                logger.info("Add new node: %s..." % (address_from_server(server)))
+                logger.info("Delete new node: %s..." % (address_from_server(server)))
                 try:
-                    await etcd_cli.add_new_node(server)
-
-                    logger.info(f"Moving data fragments count: {len(moves)}")
-                    for index, move in enumerate(tqdm(moves)):
-                        logger.info(f"Move index: {index}")
-                        await move
-
-                    logger.info("Inserted MySQL data from existed node into new node")
-                    logger.info("Update state of new MySQL node on etcd")
+                    logger.info("Update state of deleted MySQL node on etcd")
                     await etcd_cli.update_state(
                         server=server,
-                        state=State.Run,
+                        state=State.Move,
                     )
                     logger.info("New MySQL state: %s" % (State.Run.value))
 
-                    logger.info(
-                        "Delete unnecessary data(non owner of hashed) from existed MySQL node"
-                    )
-                    try:
-                        await _ring.delete_from_old_nodes(
-                            new_node=node,
+                    moved_datas: list[MovedData] = list()
+                    for index, move in enumerate(tqdm(moves)):
+                        logger.info(f"Move index: {index}")
+                        moved_data = await move
+                        assert moved_data is not None
+                        moved_datas.append(moved_data)
+
+                    self.merge_moved_data(moved_datas)
+
+                    if delete_data:
+                        logger.info(
+                            "Delete unnecessary data(non owner of hashed) from deleted MySQL node"
                         )
-                        logger.info("Optimize MySQL nodes with data moved")
-                        await _ring.optimize_table_old_nodes(
-                            new_node=node,
-                        )
-                    except RingNoMoveYet:
-                        logger.info("No moved data")
+                        try:
+                            await _ring.delete_data_from_deleted_node(
+                                node=node,
+                            )
+                            logger.info("Optimize MySQL nodes with data moved")
+                            await _ring.optimize_table_deleted_node(
+                                node=node,
+                            )
+                        except RingNoMoveYet:
+                            logger.info("No moved data")
 
                     logger.info("Done !")
                     return
@@ -150,3 +156,14 @@ class MySQLAdder:
                 raise EtcdConnectError("No alive etcd nodes")
         except MySQLEtcdDuplicateNode:
             logger.error("This IP address already exists on etcd")
+
+    def merge_moved_data(self, datas: list[MovedData]):
+        _d: dict[TableName, int] = dict()
+        for data in datas:
+            for by_table in data.tables:
+                _d.setdefault(by_table.tablename, 0)
+                _d[by_table.tablename] += by_table.moved_count
+
+        for table, count in _d.items():
+            logger.info("Moved data info:")
+            logger.info(f"\tTable: {table}, Count: {count}")

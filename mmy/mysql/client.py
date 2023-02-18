@@ -1,7 +1,9 @@
 import abc
 import asyncio
 import ipaddress
+import logging
 import time
+from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -19,7 +21,8 @@ from typing import (
 import aiomysql
 from aiomysql.cursors import DictCursor
 from dacite import Config, from_dict
-from loguru import logger
+
+from .sql import SQLPoint
 
 
 class _AbcGetAsyncIter(abc.ABC):
@@ -96,6 +99,7 @@ class _GetAsyncIter(_AbcGetAsyncIter):
         self._limit_once = limit_once
         self._i = 0
         self._rows_count: int | None = None
+        self.logger = logging.getLogger(__name__)
 
     def __aiter__(self):
         self._i = 0
@@ -105,7 +109,7 @@ class _GetAsyncIter(_AbcGetAsyncIter):
         self,
     ) -> int:
         async with self._cursor:
-            logger.debug(
+            self.logger.debug(
                 self._cursor.mogrify(
                     f"SELECT COUNT(*) as rows_count FROM {self._table}",
                 )
@@ -123,7 +127,7 @@ class _GetAsyncIter(_AbcGetAsyncIter):
             self._rows_count = await self.get_table_rows()
 
         while self._i < self._rows_count:
-            logger.debug(
+            self.logger.debug(
                 self._cursor.mogrify(
                     f"SELECT * FROM {self._table} LIMIT %(limit)s OFFSET %(offset)s",
                     {
@@ -149,11 +153,13 @@ class _GetAsyncIter(_AbcGetAsyncIter):
 def log_elapsed_time(title: str):
     def _log_elapsed_time(func):
         async def _w(*args, **kwargs):
+            self: MySQLClient = args[0]
+            assert isinstance(self, MySQLClient) is True
             _s = time.perf_counter()
             await func(*args, **kwargs)
             _e = time.perf_counter()
             _elapsed: float = round(_e - _s, 2)
-            logger.info(f"Elapsed time({title}): {_elapsed}s")
+            self.logger.info(f"Elapsed time({title}): {_elapsed}s: {func.__name__}")
 
         return _w
 
@@ -195,7 +201,7 @@ class MmyMySQLInfo:
     tables: list[MySQLTableInfo]
     default_userinfo: MySQLAuthInfo
 
-    def by_tables(self) -> MySQLAuthInfoByTable:
+    def auth_by_tables(self) -> MySQLAuthInfoByTable:
         _ts: _MySQLAuthInfoByTable = dict()
         for t in self.tables:
             _ts[TableName(t.name)] = MySQLAuthInfo(
@@ -222,8 +228,9 @@ class MySQLClient:
         self._host = host
         self._port = port
         self._db = auth.db
-        self._auth: MySQLAuthInfoByTable = auth.by_tables()
+        self._auth: MySQLAuthInfoByTable = auth.auth_by_tables()
         self._connect_timeout = connect_timeout
+        self.logger = logging.getLogger(__name__)
 
     def _default_connect(self):
         return aiomysql.connect(
@@ -281,11 +288,10 @@ class MySQLClient:
             cursor = await connect.cursor()
             async with cursor:
                 columns: str = ", ".join(first_item.keys())
-                values: str = ", ".join(
-                    list(map(lambda x: "%(" + x + ")s", first_item.keys()))
-                )
+                values: str = ", ".join(list(map(lambda x: "%s", first_item.keys())))
                 await cursor.executemany(
-                    f"INSERT INTO {table}({columns}) VALUES ({values})", datas
+                    f"INSERT INTO {table}({columns}) VALUES ({values})",
+                    [tuple(i.values()) for i in datas],
                 )
             await connect.commit()
 
@@ -312,8 +318,8 @@ class MySQLClient:
     async def consistent_hashing_select(
         self,
         table: TableName,
-        start: str,
-        end: str,
+        start: SQLPoint,
+        end: SQLPoint,
         limit_once: int = 10000,
     ) -> AsyncGenerator[list[dict[str, Any]], None]:
         keys: list[MySQLKeys] = await self.primary_keys_info(table)
@@ -331,6 +337,7 @@ class MySQLClient:
                 self._i = 0
                 self._hash_fn = "MD5"
                 self._rows_count: int | None = None
+                self.logger = logging.getLogger(__name__)
 
             def __aiter__(self):
                 self._i = 0
@@ -340,20 +347,20 @@ class MySQLClient:
                 primary_key: MySQLKeys = keys[0]
                 primary_keyname: str = primary_key.Column_name
                 if self._rows_count is None:
-                    logger.debug(
+                    self.logger.debug(
                         self._cursor.mogrify(
-                            f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname})>%(start)s AND {self._hash_fn}({primary_keyname})<%(end)s",
+                            f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s",
                             {
-                                "start": start,
-                                "end": end,
+                                "start": start.point,
+                                "end": end.point,
                             },
                         )
                     )
                     await self._cursor.execute(
-                        f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname})>%(start)s AND {self._hash_fn}({primary_keyname})<%(end)s",
+                        f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s",
                         {
-                            "start": start,
-                            "end": end,
+                            "start": start.point,
+                            "end": end.point,
                         },
                     )
                     res = await self._cursor.fetchone()
@@ -361,22 +368,22 @@ class MySQLClient:
                     self._rows_count = int(res["rows_count"])
 
                 while self._i < self._rows_count:
-                    logger.debug(
+                    self.logger.debug(
                         self._cursor.mogrify(
-                            f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname})>%(start)s AND {self._hash_fn}({primary_keyname})<%(end)s LIMIT %(limit)s OFFSET %(offset)s",
+                            f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s LIMIT %(limit)s OFFSET %(offset)s",
                             {
-                                "start": start,
-                                "end": end,
+                                "start": start.point,
+                                "end": end.point,
                                 "limit": self._limit_once,
                                 "offset": self._i,
                             },
                         )
                     )
                     await self._cursor.execute(
-                        f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname})>%(start)s AND {self._hash_fn}({primary_keyname})<%(end)s LIMIT %(limit)s OFFSET %(offset)s",
+                        f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s LIMIT %(limit)s OFFSET %(offset)s",
                         {
-                            "start": start,
-                            "end": end,
+                            "start": start.point,
+                            "end": end.point,
                             "limit": self._limit_once,
                             "offset": self._i,
                         },
@@ -396,9 +403,9 @@ class MySQLClient:
     async def consistent_hashing_delete(
         self,
         table: TableName,
-        start: str,
-        end: str,
-    ):
+        start: SQLPoint,
+        end: SQLPoint,
+    ) -> int:
         keys: list[MySQLKeys] = await self.primary_keys_info(table)
         primary_key: MySQLKeys = keys[0]
         primary_keyname: str = primary_key.Column_name
@@ -406,60 +413,60 @@ class MySQLClient:
         async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
-                logger.debug(
+                self.logger.info(
                     cursor.mogrify(
-                        f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname})>%(start)s AND {_hash_fn}({primary_keyname})<%(end)s",
+                        f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
                         {
-                            "start": start,
-                            "end": end,
+                            "start": start.point,
+                            "end": end.point,
                         },
                     )
                 )
                 await cursor.execute(
-                    f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname})>%(start)s AND {_hash_fn}({primary_keyname})<%(end)s",
+                    f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
                     {
-                        "start": start,
-                        "end": end,
+                        "start": start.point,
+                        "end": end.point,
                     },
                 )
                 res = await cursor.fetchone()
                 assert res["rows_count"] is not None
                 _rows_count = int(res["rows_count"])
-                logger.info(
-                    f'Number of rows included in range("{start}"~"{end}") to be deleted by hash value of primary key by "{_hash_fn}": {_rows_count}'
+                self.logger.info(
+                    f'[{table}] The number of rows included in range("{start}"~"{end}") to be deleted by hash value of primary key by "{_hash_fn}": {_rows_count}rows'
                 )
                 if _rows_count == 0:
-                    logger.info(
+                    self.logger.info(
                         f'No deleted rows that is included in "{start}" to "{end}"'
                     )
-                    return
+                    return 0
 
-                @log_elapsed_time("Delete rows")
                 async def _actually_delete():
-                    logger.debug(
+                    self.logger.info(f"Actually delete")
+                    self.logger.info(
                         cursor.mogrify(
                             f"DELETE FROM {table} WHERE {_hash_fn}({primary_keyname})>%(start)s AND {_hash_fn}({primary_keyname})<%(end)s",
                             {
-                                "start": start,
-                                "end": end,
+                                "start": start.point,
+                                "end": end.point,
                             },
                         )
                     )
                     affected_rows = await cursor.execute(
                         f"DELETE FROM {table} WHERE {_hash_fn}({primary_keyname})>%(start)s AND {_hash_fn}({primary_keyname})<%(end)s",
                         {
-                            "start": start,
-                            "end": end,
+                            "start": start.point,
+                            "end": end.point,
                         },
                     )
-                    logger.info(f"Deleted rows: {affected_rows}")
+                    self.logger.info(f"Deleted rows: {affected_rows}")
                     assert _rows_count == affected_rows
 
                 await _actually_delete()
 
             await connect.commit()
-            logger.info(f"Do commit")
-            return
+            self.logger.info(f"Do commit")
+            return _rows_count
 
     async def map_per_row(
         self,
@@ -494,10 +501,11 @@ class MySQLClient:
         _c: list[str] = [i.Field for i in columns]
 
         def _check_key(x: dict[str, Any]) -> dict[str, Any]:
+            _x: dict[str, Any] = copy(x)
             for key in x.keys():
                 if key not in _c:
-                    x.pop(key)
-            return x
+                    _x.pop(key)
+            return _x
 
         return list(map(_check_key, datas))
 
@@ -563,6 +571,7 @@ class MySQLClient:
 
     @log_elapsed_time("Ping")
     async def ping(self):
+        self.logger.debug(f"PING with {self._host}:{self._port}")
         async with self._default_connect() as connect:
             await asyncio.wait_for(
                 connect.ping(reconnect=False),

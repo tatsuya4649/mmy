@@ -88,10 +88,8 @@ class ProxyConnection(Connection):
         key: str,
         **kwargs,
     ):
-        #
-        #        if "ssl" in kwargs:
-        #            raise ValueError("Unsupport TLS/SSL")
-
+        if "ssl" in kwargs:
+            warnings.warn("%s is not supported TSL/SSL" % (SYSTEM_NAME))
         super().__init__(**kwargs)
         self.create_keydata_from_key(key)
 

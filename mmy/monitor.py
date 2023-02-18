@@ -1,7 +1,7 @@
 import asyncio
+import logging
 import random
 
-from loguru import logger
 from rich import text
 
 from .etcd import ETCD_SCHEME, MySQLEtcdClient
@@ -9,6 +9,8 @@ from .mysql.client import MySQLClient
 from .mysql.hosts import MySQLHosts
 from .parse import MmyMySQLInfo
 from .server import State, _Server
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class MmyMonitor:
@@ -21,6 +23,7 @@ class MmyMonitor:
         max_jitter: float = 10.0,
         connect_timeout: int = 5,
     ):
+        super().__init__()
         self._mysql_hosts: MySQLHosts = mysql_hosts
         self._etcd: list[_Server] = etcd
         self._min_jitter: float = min_jitter

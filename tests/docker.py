@@ -8,3 +8,7 @@ class container:
     service_name: str
     host: ipaddress.IPv4Address | ipaddress.IPv6Address
     port: int
+
+
+class DockerStartupError(RuntimeError):
+    pass

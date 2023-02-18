@@ -1,7 +1,6 @@
 import hashlib
+import ipaddress
 from typing import NewType
-
-from loguru import logger
 
 from .server import Server, State
 
@@ -11,7 +10,6 @@ ServerID = NewType("ServerID", str)
 class ServerPool:
     def __init__(
         self,
-        _logger=None,
     ):
         self._servers: list[Server] = list()
         self._state_map: dict[State, list[Server]] = {
@@ -21,7 +19,6 @@ class ServerPool:
             State.Unknown: list(),
         }
         self._id_map: dict[ServerID, Server] = dict()
-        self.logger = _logger if _logger is not None else logger
 
     def add(self, server: Server) -> ServerID:
         _sid: ServerID = self.sid_from_address(server.host, server.port)
@@ -36,8 +33,10 @@ class ServerPool:
         return _sid
 
     @classmethod
-    def sid_from_address(cls, host: str, port: int) -> ServerID:
-        hp: str = "%s_%d" % (host, port)
+    def sid_from_address(
+        cls, host: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int
+    ) -> ServerID:
+        hp: str = "%s_%d" % (str(host), port)
         _ssid: str = hashlib.md5(hp.encode("utf-8")).hexdigest()
         return ServerID(_ssid)
 

@@ -1,6 +1,5 @@
 uhashring==2.2
 httpx==0.21.1
-loguru==0.6.0
 dacite==1.7.0
 click==8.0.3
 rich==10.13.0

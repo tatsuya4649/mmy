@@ -1,19 +1,19 @@
 import asyncio
+import logging
 import os
-import random
 
 import click
 import httpx
-from loguru import logger
-from rich import print
 
+from mmy.const import SYSTEM_NAME
 from mmy.etcd import MySQLEtcdClient, MySQLEtcdData
-from mmy.log import init_log
 from mmy.monitor import MmyMonitor
 from mmy.mysql.hosts import MySQLHosts
 from mmy.mysql.proxy import run_proxy_server
 from mmy.parse import MmyMySQLInfo, MmyYAML, parse_yaml
 from mmy.server import _Server, address_from_server
+
+logger = logging.getLogger(__name__)
 
 
 async def monitoring_mysql_servers(
@@ -26,7 +26,6 @@ async def monitoring_mysql_servers(
     """
     Monitor MySQL's health and find broken host, update cluster info on etcd.
     """
-    logger.info("Start monitoring MySQL cluster")
     monitor: MmyMonitor = MmyMonitor(
         mysql_hosts=mysql_hosts,
         auth=mysql_info,
@@ -71,15 +70,9 @@ async def check_mysql(etcd: _Server):
         logger.error(
             f"Can't connect to etcd cluster. (with {address_from_server(etcd)})"
         )
-        print("\n")
-        print("\t[bold]Please fix and try. Bye.[/bold]")
-        print("\n")
     except Exception as e:
 
         logger.exception(e)
-        print("\n")
-        print("\t[bold]Please fix and try. Bye.[/bold]")
-        print("\n")
         os._exit(1)
     return
 
@@ -116,11 +109,6 @@ def _main(
     command_timeout: int,
     config_path: str,
 ):
-    print("\n")
-    print("Hello, this is [bold]mmysql[/bold].")
-    print("\n")
-
-    init_log()
     logger.info("Host: %s" % (host))
     logger.info("Port: %s" % (port))
     logger.info("Etcd host: %s" % (etcd_host))

@@ -2,8 +2,6 @@ import asyncio
 import struct
 from dataclasses import dataclass
 
-from loguru import logger
-
 from ..const import SYSTEM_NAME
 from .errcode import MySQLErrorCode
 from .hosts import MySQLHostBroken
@@ -80,7 +78,6 @@ async def send_host_broken_packet(
         _header: bytes = struct.pack(f"<BHB", 0, 0, 255)
         client_writer.write(_header)
         await client_writer.drain()
-        logger.debug("Send broken host packet")
     finally:
         client_writer.close()
         raise MySQLHostBroken
