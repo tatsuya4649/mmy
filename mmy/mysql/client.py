@@ -5,7 +5,7 @@ import logging
 import time
 from copy import copy
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, auto
 from typing import (
     Any,
     AsyncGenerator,
@@ -21,13 +21,15 @@ from typing import (
 import aiomysql
 from aiomysql.cursors import DictCursor
 from dacite import Config, from_dict
+from rich import print
 
+from .errcode import asyncgen_retry, co_retry
 from .sql import SQLPoint
 
 
 class _AbcGetAsyncIter(abc.ABC):
     @abc.abstractmethod
-    def __init__(self, cursor, table, limit_once):
+    def __init__(self, table, limit_once, **kwargs):
         """ """
 
     @abc.abstractmethod
@@ -65,7 +67,7 @@ class MySQLColumns:
     Null: YesNo
     Key: str
     Default: Any | None
-    Extra: _Extra
+    Extra: str
 
 
 @dataclass
@@ -87,12 +89,18 @@ class MySQLKeys:
     Expression: str | None
 
 
+class MySQLInsertDuplicateBehavior(Enum):
+    Raise = auto()
+    DeleteAutoIncrement = auto()
+
+
 class _GetAsyncIter(_AbcGetAsyncIter):
     def __init__(
         self,
         cursor: DictCursor,
         table: str,
         limit_once: int,
+        **kwargs,
     ):
         self._cursor = cursor
         self._table = table
@@ -109,11 +117,6 @@ class _GetAsyncIter(_AbcGetAsyncIter):
         self,
     ) -> int:
         async with self._cursor:
-            self.logger.debug(
-                self._cursor.mogrify(
-                    f"SELECT COUNT(*) as rows_count FROM {self._table}",
-                )
-            )
             await self._cursor.execute(
                 f"SELECT COUNT(*) as rows_count FROM {self._table}",
             )
@@ -127,15 +130,6 @@ class _GetAsyncIter(_AbcGetAsyncIter):
             self._rows_count = await self.get_table_rows()
 
         while self._i < self._rows_count:
-            self.logger.debug(
-                self._cursor.mogrify(
-                    f"SELECT * FROM {self._table} LIMIT %(limit)s OFFSET %(offset)s",
-                    {
-                        "limit": self._limit_once,
-                        "offset": self._i,
-                    },
-                )
-            )
             await self._cursor.execute(
                 f"SELECT * FROM {self._table} LIMIT %(limit)s OFFSET %(offset)s",
                 {
@@ -158,8 +152,8 @@ def log_elapsed_time(title: str):
             _s = time.perf_counter()
             await func(*args, **kwargs)
             _e = time.perf_counter()
-            _elapsed: float = round(_e - _s, 2)
-            self.logger.info(f"Elapsed time({title}): {_elapsed}s: {func.__name__}")
+            _elapsed: float = round(_e - _s, 4)
+            self.logger.debug(f"Elapsed time({title}): {_elapsed}s: {func.__name__}")
 
         return _w
 
@@ -215,6 +209,59 @@ class MmyMySQLInfo:
         )
 
 
+def _get_retry_count() -> int | float:
+    return RETRY_COUNT
+
+
+def _get_retry_interval_secs() -> int | float:
+    return RETRY_INTERVAL_SECS
+
+
+def multiple_retry_mysql_when_connection_error(cor):
+    async def _wrap_rollback(*args, **kwargs):
+        client = args[0]
+        assert isinstance(client, MySQLClient)
+
+        _retry_count = _get_retry_count()
+        _retry_interval_count = _get_retry_interval_secs()
+        return await co_retry(
+            co=cor,
+            retry_count=_retry_count,
+            retry_interval_secs=_retry_interval_count,
+            args=args,
+            kwargs=kwargs,
+        )
+
+    return _wrap_rollback
+
+
+def asyncgen_multiple_retry_mysql_when_connection_error(cor):
+    async def _wrap_rollback(*args, **kwargs):
+        client = args[0]
+        assert isinstance(client, MySQLClient)
+
+        _retry_count = _get_retry_count()
+        _retry_interval_count = _get_retry_interval_secs()
+        _c = asyncgen_retry(
+            asyncgen=cor,
+            retry_count=_retry_count,
+            retry_interval_secs=_retry_interval_count,
+            args=args,
+            kwargs=kwargs,
+        )
+        try:
+            yield await _c.__anext__()
+        except StopAsyncIteration:
+            return
+
+    return _wrap_rollback
+
+
+RETRY_COUNT: int = 3
+RETRY_INTERVAL_SECS: int = 10
+LENGTH: int = 4
+
+
 class MySQLClient:
     IDENTIFY_PRIMARY: str = "PRIMARY"
 
@@ -224,6 +271,7 @@ class MySQLClient:
         port: int,
         auth: MmyMySQLInfo,
         connect_timeout: int = CONNECT_TIMEOUT,
+        debug: bool = True,
     ):
         self._host = host
         self._port = port
@@ -231,6 +279,7 @@ class MySQLClient:
         self._auth: MySQLAuthInfoByTable = auth.auth_by_tables()
         self._connect_timeout = connect_timeout
         self.logger = logging.getLogger(__name__)
+        self._debug = debug
 
     def _default_connect(self):
         return aiomysql.connect(
@@ -258,6 +307,24 @@ class MySQLClient:
             autocommit=False,
         )
 
+    async def get_table_size_in_kb(self, table: TableName) -> int:
+        async with self._connect(table) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                await cursor.execute(
+                    f"SELECT round(((data_length + index_length) / 1024), 2) as MB \
+                        FROM information_schema.TABLES \
+                            WHERE table_schema=%(table_schema)s AND table_name=%(table_name)s",
+                    {
+                        "table_schema": self._db,
+                        "table_name": str(table),
+                    },
+                )
+                res = await cursor.fetchone()
+                assert res["MB"] is not None
+                _mb: int = int(res["MB"])
+                return _mb
+
     async def get_table_rows(
         self,
         table: TableName,
@@ -273,53 +340,67 @@ class MySQLClient:
                 rows_count: int = int(res["rows_count"])
                 return rows_count
 
+    @multiple_retry_mysql_when_connection_error
     async def insert(
         self,
         table: TableName,
         datas: list[dict[str, Any]],
-    ) -> None:
+        insert_ignore: bool,
+    ) -> int:
         if len(datas) == 0:
-            return
+            return 0
         if len(datas) > INSERT_ONCE_LIMIT:
             raise MySQLClientTooManyInsertAtOnce
 
         first_item = datas[0]
+        affected: int = 0
         async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 columns: str = ", ".join(first_item.keys())
                 values: str = ", ".join(list(map(lambda x: "%s", first_item.keys())))
-                await cursor.executemany(
-                    f"INSERT INTO {table}({columns}) VALUES ({values})",
-                    [tuple(i.values()) for i in datas],
-                )
+                if insert_ignore:
+                    update_columns: str = ", ".join(
+                        list(map(lambda x: f"{x}=_f.{x}", first_item.keys()))
+                    )
+                    affected = await cursor.executemany(
+                        f"INSERT INTO {table}({columns}) VALUES ({values}) as _f ON DUPLICATE KEY UPDATE {update_columns}",
+                        [tuple(i.values()) for i in datas],
+                    )
+                else:
+                    affected = await cursor.executemany(
+                        f"INSERT INTO {table}({columns}) VALUES ({values})",
+                        [tuple(i.values()) for i in datas],
+                    )
             await connect.commit()
 
+        return affected
+
+    @asyncgen_multiple_retry_mysql_when_connection_error
     async def select(
         self,
         table: TableName,
         limit_once: int = 10000,
         iter_type: Type[GetAsyncIter] | None = None,
     ) -> AsyncGenerator[list[dict[str, Any]], None]:
-        async with self._connect(table) as connect:
-            cursor = await connect.cursor()
-            async with cursor:
-                _nclass: Type[_AbcGetAsyncIter] = _GetAsyncIter
-                if iter_type is not None:
-                    _nclass = iter_type
-                _gai: _AbcGetAsyncIter = _nclass(
-                    cursor=cursor,
-                    limit_once=limit_once,
-                    table=table,
-                )
-                async for frag in _gai:
-                    yield frag
+        _nclass: Type[_AbcGetAsyncIter] = _GetAsyncIter
+        if iter_type is not None:
+            _nclass = iter_type
+        _gai: _AbcGetAsyncIter = _nclass(
+            limit_once=limit_once,
+            table=table,
+            debug=self._debug,
+            client=self,
+        )
+        async for frag in _gai:
+            yield frag
 
     async def consistent_hashing_select(
         self,
         table: TableName,
         start: SQLPoint,
         end: SQLPoint,
+        _or: bool,
         limit_once: int = 10000,
     ) -> AsyncGenerator[list[dict[str, Any]], None]:
         keys: list[MySQLKeys] = await self.primary_keys_info(table)
@@ -327,17 +408,19 @@ class MySQLClient:
         class CHSIter(_AbcGetAsyncIter):
             def __init__(
                 self,
-                cursor: DictCursor,
                 table: str,
                 limit_once: int,
+                debug: bool,
+                client: MySQLClient,
             ):
-                self._cursor = cursor
                 self._table = table
                 self._limit_once = limit_once
                 self._i = 0
                 self._hash_fn = "MD5"
                 self._rows_count: int | None = None
                 self.logger = logging.getLogger(__name__)
+                self._debug: bool = debug
+                self._client = client
 
             def __aiter__(self):
                 self._i = 0
@@ -346,52 +429,38 @@ class MySQLClient:
             async def __anext__(self):
                 primary_key: MySQLKeys = keys[0]
                 primary_keyname: str = primary_key.Column_name
+                and_or = "OR" if _or else "AND"
                 if self._rows_count is None:
-                    self.logger.debug(
-                        self._cursor.mogrify(
-                            f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s",
-                            {
-                                "start": start.point,
-                                "end": end.point,
-                            },
-                        )
-                    )
-                    await self._cursor.execute(
-                        f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s",
-                        {
-                            "start": start.point,
-                            "end": end.point,
-                        },
-                    )
-                    res = await self._cursor.fetchone()
-                    assert res["rows_count"] is not None
-                    self._rows_count = int(res["rows_count"])
+                    async with self._client._connect(table) as connect:
+                        cursor = await connect.cursor()
+                        async with cursor:
+                            await cursor.execute(
+                                f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s",
+                                {
+                                    "start": start.point,
+                                    "end": end.point,
+                                },
+                            )
+                            res = await cursor.fetchone()
+                            assert res["rows_count"] is not None
+                            self._rows_count = int(res["rows_count"])
 
                 while self._i < self._rows_count:
-                    self.logger.debug(
-                        self._cursor.mogrify(
-                            f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s LIMIT %(limit)s OFFSET %(offset)s",
-                            {
-                                "start": start.point,
-                                "end": end.point,
-                                "limit": self._limit_once,
-                                "offset": self._i,
-                            },
-                        )
-                    )
-                    await self._cursor.execute(
-                        f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s LIMIT %(limit)s OFFSET %(offset)s",
-                        {
-                            "start": start.point,
-                            "end": end.point,
-                            "limit": self._limit_once,
-                            "offset": self._i,
-                        },
-                    )
-                    _frag = await self._cursor.fetchall()
-                    self._i += len(_frag)
-                    return _frag
-
+                    async with self._client._connect(table) as connect:
+                        cursor = await connect.cursor()
+                        async with cursor:
+                            await cursor.execute(
+                                f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s LIMIT %(limit)s OFFSET %(offset)s",
+                                {
+                                    "start": start.point,
+                                    "end": end.point,
+                                    "limit": self._limit_once,
+                                    "offset": self._i,
+                                },
+                            )
+                            _frag = await cursor.fetchall()
+                            self._i += len(_frag)
+                            return _frag
                 raise StopAsyncIteration
 
         return self.select(
@@ -400,30 +469,24 @@ class MySQLClient:
             iter_type=CHSIter,
         )
 
+    @multiple_retry_mysql_when_connection_error
     async def consistent_hashing_delete(
         self,
         table: TableName,
         start: SQLPoint,
         end: SQLPoint,
+        _or: bool,
     ) -> int:
         keys: list[MySQLKeys] = await self.primary_keys_info(table)
         primary_key: MySQLKeys = keys[0]
         primary_keyname: str = primary_key.Column_name
         _hash_fn: str = "MD5"
+        and_or = "OR" if _or else "AND"
         async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
-                self.logger.info(
-                    cursor.mogrify(
-                        f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
-                        {
-                            "start": start.point,
-                            "end": end.point,
-                        },
-                    )
-                )
                 await cursor.execute(
-                    f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s AND {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
+                    f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
                     {
                         "start": start.point,
                         "end": end.point,
@@ -432,40 +495,26 @@ class MySQLClient:
                 res = await cursor.fetchone()
                 assert res["rows_count"] is not None
                 _rows_count = int(res["rows_count"])
-                self.logger.info(
-                    f'[{table}] The number of rows included in range("{start}"~"{end}") to be deleted by hash value of primary key by "{_hash_fn}": {_rows_count}rows'
-                )
                 if _rows_count == 0:
-                    self.logger.info(
-                        f'No deleted rows that is included in "{start}" to "{end}"'
+                    self.logger.debug(
+                        f'No deleted rows "{start.point[:LENGTH]}" to "{end.point[:LENGTH]}"'
                     )
                     return 0
 
                 async def _actually_delete():
-                    self.logger.info(f"Actually delete")
-                    self.logger.info(
-                        cursor.mogrify(
-                            f"DELETE FROM {table} WHERE {_hash_fn}({primary_keyname})>%(start)s AND {_hash_fn}({primary_keyname})<%(end)s",
-                            {
-                                "start": start.point,
-                                "end": end.point,
-                            },
-                        )
-                    )
                     affected_rows = await cursor.execute(
-                        f"DELETE FROM {table} WHERE {_hash_fn}({primary_keyname})>%(start)s AND {_hash_fn}({primary_keyname})<%(end)s",
+                        f"DELETE FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
                         {
                             "start": start.point,
                             "end": end.point,
                         },
                     )
-                    self.logger.info(f"Deleted rows: {affected_rows}")
+                    self.logger.debug(f"Deleted rows: {affected_rows}")
                     assert _rows_count == affected_rows
 
                 await _actually_delete()
 
             await connect.commit()
-            self.logger.info(f"Do commit")
             return _rows_count
 
     async def map_per_row(
@@ -509,6 +558,7 @@ class MySQLClient:
 
         return list(map(_check_key, datas))
 
+    @multiple_retry_mysql_when_connection_error
     async def columns_info(self, table: TableName) -> list[MySQLColumns]:
         async with self._connect(table) as connect:
             cursor = await connect.cursor()
@@ -517,7 +567,6 @@ class MySQLClient:
                 res = await cursor.fetchall()
                 config = Config(
                     type_hooks={
-                        _Extra: _Extra,
                         YesNo: YesNo,
                     }
                 )
@@ -533,6 +582,7 @@ class MySQLClient:
 
                 return columns
 
+    @multiple_retry_mysql_when_connection_error
     async def primary_keys_info(
         self,
         table: TableName,
@@ -562,6 +612,7 @@ class MySQLClient:
                 return keys
 
     @log_elapsed_time("Optimize table")
+    @multiple_retry_mysql_when_connection_error
     async def optimize_table(self, table: TableName):
         async with self._connect(table) as connect:
             cursor = await connect.cursor()
@@ -577,3 +628,13 @@ class MySQLClient:
                 connect.ping(reconnect=False),
                 timeout=10,
             )
+
+    @log_elapsed_time("Delete all table data")
+    @multiple_retry_mysql_when_connection_error
+    async def delete_all_table_data(self, table: TableName):
+        async with self._connect(table) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                await cursor.execute(f"DELETE FROM {table}")
+            await connect.commit()
+        return

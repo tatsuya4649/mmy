@@ -8,7 +8,6 @@ import pytest
 import pytest_asyncio
 from python_on_whales import Container, docker
 from rich import print
-from tqdm import tqdm
 
 from mmy.etcd import (
     EtcdConnectError,
@@ -378,7 +377,7 @@ class TestMySQLEtcdClient:
         etcd_dockers = list(DockerEtcd)
         etcd_docker_count = len(etcd_dockers)
         _majority = etcd_docker_count // 2
-        for index, etcd in enumerate(tqdm(etcd_dockers)):
+        for index, etcd in enumerate(etcd_dockers):
             # All client is gone
             next_client_index = index + 1
             if next_client_index == etcd_docker_count:

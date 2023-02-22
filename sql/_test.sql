@@ -2,15 +2,17 @@ CREATE DATABASE IF NOT EXISTS test;
 
 CREATE TABLE IF NOT EXISTS user (
     id INT AUTO_INCREMENT,
-    uuid VARCHAR(100) UNIQUE,
+    md5 VARCHAR(100) UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     name TEXT,
     PRIMARY KEY (id)
 );
 
 CREATE TABLE IF NOT EXISTS post (
-    id INT AUTO_INCREMENT,
+    id VARCHAR(100),
+    md5 VARCHAR(100) UNIQUE,
     title TEXT,
-    uuid VARCHAR(100) UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id)
 );
 
@@ -21,11 +23,11 @@ BEGIN
   loop1:WHILE (counter < x) DO
     SELECT COUNT(*) FROM user INTO @ucount;
     IF @ucount = 0 THEN
-      INSERT INTO user(name, uuid) VALUES (MD5(UUID()), UUID());
+      INSERT INTO user(md5) VALUES (MD5(UUID()));
     ELSEIF @ucount > min_count THEN
 		  LEAVE loop1;
     END IF;
-    INSERT INTO user(name, uuid) SELECT MD5(name), UUID() FROM user;
+    INSERT INTO user(md5) SELECT MD5(UUID()) FROM user;
     SET counter = counter + 1;
   END WHILE loop1;
 END;
@@ -37,11 +39,11 @@ BEGIN
   loop2:WHILE (counter < x) DO
     SELECT COUNT(*) FROM post INTO @pcount;
     IF @pcount = 0 THEN
-      INSERT INTO post(title, uuid) VALUES (MD5(UUID()), UUID());
+      INSERT INTO post(id, md5) VALUES (MD5(UUID()), MD5(UUID()));
     ELSEIF @pcount > min_count THEN
       LEAVE loop2;
     END IF;
-    INSERT INTO post(title, uuid) SELECT MD5(title), UUID() FROM post;
+    INSERT INTO post(id, md5) SELECT MD5(UUID()), MD5(UUID()) FROM post;
     SET counter = counter + 1;
   END WHILE loop2;
 END

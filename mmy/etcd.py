@@ -105,7 +105,7 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
                             message=_status["message"],
                         )
 
-                    logger.info(_status)
+                    logger.debug(_status)
                     return _status
             except Exception as e:
                 _e = e
@@ -126,7 +126,7 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
         _bytes: bytes = _value.encode("utf-8")
         _vbytes: bytes = base64.b64decode(_bytes)
         jdict = json.loads(_vbytes)
-        logger.info("Received value: %s" % jdict)
+        logger.debug("Received value: %s" % jdict)
         return jdict
 
     @abc.abstractmethod
@@ -299,8 +299,8 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
                 _kvs = jdata.get("kvs")
                 if _kvs is None:
                     logger.info(
-                        "[%s] Not found MySQL etcd data (key: %s)"
-                        % (_hash, self.KEYNAME.decode("utf-8"))
+                        "[%s] Not found MySQL etcd data (key: %s) on %s"
+                        % (_hash, self.KEYNAME.decode("utf-8"), self._address)
                     )
                     return MySQLEtcdData(
                         nodes=[],
@@ -373,7 +373,7 @@ class MySQLEtcdClient(EtcdClient[MySQLEtcdData]):
                 len(
                     list(
                         filter(
-                            lambda x: x.host == server.host and x.port == server.port,
+                            lambda x: x == server,
                             data.nodes,
                         )
                     )

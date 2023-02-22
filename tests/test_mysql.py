@@ -3,25 +3,19 @@ import ipaddress
 from enum import Enum
 from typing import Coroutine
 
+import aiomysql
 import pytest
 import pytest_asyncio
+from aiomysql.cursors import DictCursor
+from mmy.mysql.client import (INSERT_ONCE_LIMIT, MySQLClient,
+                              MySQLClientTooManyInsertAtOnce, MySQLColumns,
+                              MySQLKeys, TableName, _Extra)
 from pymysql.err import OperationalError
 from python_on_whales import docker
 from python_on_whales.exceptions import NoSuchContainer
 from rich import print
-from tqdm import tqdm
 
-from mmy.mysql.client import (
-    INSERT_ONCE_LIMIT,
-    MySQLClient,
-    MySQLClientTooManyInsertAtOnce,
-    MySQLColumns,
-    MySQLKeys,
-    TableName,
-    _Extra,
-)
-
-from ._mysql import TEST_TABLE1, TEST_TABLE2, _mmy_info
+from ._mysql import ROOT_USERINFO, TEST_TABLE1, TEST_TABLE2, _mmy_info
 from .docker import DockerStartupError, container
 
 
@@ -69,7 +63,7 @@ def get_mysql_docker_for_test(count: int = DEFAULT):
 
 
 class TMySQLClient(MySQLClient):
-    GENERATE_RANDOM_DATA_REPEAT_COUNT: int = 10
+    GENERATE_RANDOM_DATA_REPEAT_COUNT: int = 20
     GENERATE_RANDOM_DATA_MIN_COUNT: int = 10000
 
     def __init__(
@@ -130,7 +124,7 @@ async def up_mysql_docker_container(container: DockerMySQL):
         detach=True,
     )
     RETRY_COUNT: int = 60
-    for _ in tqdm(range(RETRY_COUNT)):
+    for _ in range(RETRY_COUNT):
         try:
             cli = TMySQLClient(
                 port=container.value.port,
@@ -152,7 +146,7 @@ async def up_mysql_docker_container(container: DockerMySQL):
 
 
 async def up_mysql_docker_containers():
-    for mysql in tqdm(get_mysql_docker_for_test()):
+    for mysql in get_mysql_docker_for_test():
         await up_mysql_docker_container(mysql)
 
     return
@@ -160,8 +154,7 @@ async def up_mysql_docker_containers():
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def fix_up_mysql_docker_containers():
-    print("Setup MySQL docker")
-    for mysql in tqdm(get_mysql_docker_for_test()):
+    for mysql in get_mysql_docker_for_test():
         await up_mysql_docker_container(mysql)
 
     yield
@@ -171,7 +164,7 @@ async def fix_up_mysql_docker_containers():
 def fix_down_all_mysql_docker_containers():
     service_names = [i.value.service_name for i in DockerMySQL]
     ps = docker.compose.ps(service_names)
-    for ps_info, service_name in zip(tqdm(ps), service_names):
+    for ps_info, service_name in zip(ps, service_names):
         if ps_info.state.running is False:
             raise RuntimeError(f'Already not running: "{service_name}"')
 
@@ -187,7 +180,7 @@ def fix_down_all_mysql_docker_containers():
 
 def down_all_mysql_docker_containers(volumes: bool = False):
     print("Delete all MySQL docker containers")
-    for container in tqdm(list(DockerMySQL)):
+    for container in list(DockerMySQL):
         container_name: str = container.value.container_name
         try:
             docker.stop([container_name])
@@ -197,7 +190,7 @@ def down_all_mysql_docker_containers(volumes: bool = False):
     if volumes:
         print("Delete all volumes of MySQL's container")
         delete_volumes = list()
-        for container in tqdm(list(DockerMySQL)):
+        for container in list(DockerMySQL):
             try:
                 inspect = docker.container.inspect(container_name)
             except NoSuchContainer:
@@ -211,6 +204,63 @@ def down_all_mysql_docker_containers(volumes: bool = False):
             docker.volume.remove(volume)
 
     return
+
+
+async def delete_all_table(
+    container,
+    mmy_info,
+):
+    async with aiomysql.connect(
+        host=str(container.value.host),
+        port=container.value.port,
+        user=ROOT_USERINFO.user,
+        password=ROOT_USERINFO.password,
+        db=mmy_info.mysql.db,
+    ) as connect:
+        cur = await connect.cursor()
+        await cur.execute("DELETE FROM %s" % (TEST_TABLE1))
+        await connect.commit()
+
+        cur = await connect.cursor()
+        await cur.execute("DELETE FROM %s" % (TEST_TABLE2))
+        await connect.commit()
+
+        cur = await connect.cursor()
+        await cur.execute("OPTIMIZE TABLE %s" % (TEST_TABLE1))
+        await connect.commit()
+        cur = await connect.cursor()
+        await cur.execute("OPTIMIZE TABLE %s" % (TEST_TABLE2))
+        await connect.commit()
+
+
+async def random_generate_data(
+    container,
+    mmy_info,
+    genereate_repeate: int,
+    min_count: int,
+):
+    async with aiomysql.connect(
+        host=str(container.value.host),
+        port=container.value.port,
+        user=ROOT_USERINFO.user,
+        cursorclass=DictCursor,
+        password=ROOT_USERINFO.password,
+        db=mmy_info.mysql.db,
+    ) as connect:
+        # Delete all table data from container
+        await delete_all_table(container, mmy_info)
+        cur = await connect.cursor()
+        await cur.execute(
+            "CALL generate_random_user(%d, %d)" % (genereate_repeate, min_count)
+        )
+        await connect.commit()
+
+        cur = await connect.cursor()
+        await cur.execute(
+            "CALL generate_random_post(%d, %d)" % (genereate_repeate, min_count)
+        )
+        await connect.commit()
+        return
 
 
 @pytest_asyncio.fixture(scope="function", autouse=True)

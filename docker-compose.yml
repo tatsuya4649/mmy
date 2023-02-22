@@ -155,8 +155,6 @@ services:
     mem_limit: 100m
   etcd10:
     build: .
-    volumes:
-      - ./docker/conf/etcd:/etc/etcd
     command: |-
       /usr/local/bin/etcd
       -name etcd10

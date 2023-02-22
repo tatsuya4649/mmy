@@ -9,12 +9,16 @@ from typing import Any, Callable, Coroutine, TypeAlias
 from rich import print
 
 from ..const import SYSTEM_NAME
-from ..server import _Server, address_from_server
+from ..server import Server, State, _Server, address_from_server
 from .hosts import MySQLHostBroken, MySQLHosts
 from .packet import send_error_packet_to_client, send_host_broken_packet
-from .proxy_err import (MmyLocalInfileUnsupportError, MmyProtocolError,
-                        MmyReadTimeout, MmyTLSUnsupportError,
-                        MmyUnmatchServerError)
+from .proxy_err import (
+    MmyLocalInfileUnsupportError,
+    MmyProtocolError,
+    MmyReadTimeout,
+    MmyTLSUnsupportError,
+    MmyUnmatchServerError,
+)
 
 PROTOCOL_ID: bytes = b"_MMY"
 
@@ -39,8 +43,8 @@ class KeyData:
         )
 
 
-async def select_mysql_host(mysql_hosts: MySQLHosts, key_data: KeyData) -> _Server:
-    return mysql_hosts.get_host(key_data.data.decode("utf-8"))
+async def select_mysql_host(mysql_hosts: MySQLHosts, key_data: KeyData) -> Server:
+    return mysql_hosts.get_host_without_move(key_data.data.decode("utf-8"))
 
 
 from enum import Enum, auto
@@ -1243,7 +1247,7 @@ class MySQLProxyContext:
         return self._server
 
     async def select_server(self):
-        server: _Server = await select_mysql_host(
+        server: Server = await select_mysql_host(
             mysql_hosts=self._mysql_hosts,
             key_data=self.key_data,
         )

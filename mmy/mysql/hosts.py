@@ -3,7 +3,7 @@ from typing import Any, Generator
 
 from uhashring import HashRing
 
-from ..ring import MySQLMetaRing, Node
+from ..ring import MySQLMetaRing
 from ..server import Server, State, _Server
 
 
@@ -17,6 +17,7 @@ class MySQLHosts(MySQLMetaRing):
     ):
         self.logger = logging.getLogger(__name__)
         self._ring = HashRing()
+        self._ring_witout_move = HashRing()
         self._address_map: dict[str, State] = dict()
 
     def __str__(self):
@@ -30,32 +31,47 @@ class MySQLHosts(MySQLMetaRing):
     def update(self, nodes: list[Server]):
         _nodes: dict[str, Any] = dict()
         self._address_map.clear()
+        self._ring_witout_move = HashRing()
         for _n in nodes:
-            _node = Node(host=_n.host, port=_n.port)
-            _nodes[self.nodename_from_node(_node)] = {
+            _node = {
                 "instance": _n,
                 "vnodes": self.RING_VNODES,
             }
+            _nodes[self._ring.nodename_from_node(_n)] = _node
             self._address_map[_n.address_format()] = _n.state
+            if _n.state is not State.Move:
+                self._ring_witout_move.add_node(_node)
         self._ring = HashRing(nodes=_nodes)
 
-    def get_host(self, key: str) -> _Server:
+    def get_host(self, key: str) -> Server:
         if self._ring.size == 0:
             raise RuntimeError("No hosts")
 
         _h = self._ring.get(key)
         self.logger.debug(f"Get server from key: {key}")
         self.logger.debug(_h)
-        _s = _h["instance"]
+        _s: Server = _h["instance"]
 
         if _s.state == State.Broken:
             self.logger.debug("Detect MySQL is broken")
             raise MySQLHostBroken
 
-        return _Server(
-            host=_s.host,
-            port=_s.port,
-        )
+        return _s
+
+    def get_host_without_move(self, key: str) -> Server:
+        if self._ring_witout_move.size == 0:
+            raise RuntimeError("No hosts")
+
+        _h = self._ring_witout_move.get(key)
+        self.logger.debug(f"Get server from key: {key}")
+        self.logger.debug(_h)
+        _s: Server = _h["instance"]
+
+        if _s.state == State.Broken:
+            self.logger.debug("Detect MySQL is broken")
+            raise MySQLHostBroken
+
+        return _s
 
     def gen_hosts(self) -> Generator[str, None, None]:
         for i in self._ring.get_instances():
