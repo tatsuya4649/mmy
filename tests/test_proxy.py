@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import random
 import time
@@ -11,20 +12,21 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from python_on_whales import docker
-from rich import print
-
 from mmy.mysql.hosts import MySQLHostBroken, MySQLHosts
 from mmy.mysql.proxy import ProxyServer
 from mmy.mysql.proxy_connection import ProxyConnection, proxy_connect
 from mmy.mysql.proxy_err import MmyLocalInfileUnsupportError, MmyUnmatchServerError
 from mmy.server import Server, State, _Server
+from python_on_whales import docker
+from rich import print
 
 from ._mysql import TEST_TABLE1
 from .test_mysql import DockerMySQL, container
 
 HOST = "127.0.0.1"
 PROXY_SERVER_STARTUP_TIMEOUT: int = 10
+
+logger = logging.getLogger(__name__)
 
 
 @pytest.fixture
@@ -229,7 +231,6 @@ async def test_proxy(
     random_key = str(time.time_ns())
     async with await fix_proxy_connect(random_key, port) as connect:
         await connect.ping()
-        print("Helo?")
 
 
 @pytest.mark.asyncio
@@ -300,11 +301,12 @@ async def test_insert_many(
 ):
     import random
 
-    from tqdm import tqdm
-
     random_key = random.randint(1000000, 10000000)
     keys = list()
-    for i in tqdm(range(count)):
+    for i in range(count):
+        if i % 100 == 0:
+            logger.info(f"Complete: {int(100*(i/count))}%")
+
         _rk = str(random_key + i)
         keys.append(_rk)
         async with fix_proxy_connect(_rk, proxy_server_start) as connect:
@@ -364,11 +366,12 @@ async def test_update_many(
 ):
     import random
 
-    from tqdm import tqdm
-
     random_key = random.randint(1000000, 10000000)
     keys = list()
-    for i in tqdm(range(count)):
+    for i in range(count):
+        if i % 100 == 0:
+            logger.info(f"Complete: {int(100*(i/count))}%")
+
         _rk = str(random_key + i)
         keys.append(_rk)
         async with fix_proxy_connect(_rk, proxy_server_start) as connect:
@@ -430,8 +433,6 @@ async def test_delete_many(
 ):
     import random
 
-    from tqdm import tqdm
-
     random_key = random.randint(1000000, 10000000)
     selects = list()
     _rk = str(random_key)
@@ -444,7 +445,10 @@ async def test_delete_many(
             )
             selects.extend(await cursor.fetchall())
 
-    for row in tqdm(selects):
+    for row in selects:
+        if i % 100 == 0:
+            logger.info(f"Complete: {int(100*(i/count))}%")
+
         async with fix_proxy_connect(_rk, proxy_server_start) as connect:
             cursor = await connect.cursor()
             async with cursor:

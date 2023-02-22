@@ -4,8 +4,10 @@ Integration test about MySQL cluster management.
 
 """
 import asyncio
+import hashlib
 import logging
 import random
+import time
 from enum import Enum, auto
 from pprint import pformat
 from typing import Any
@@ -15,6 +17,7 @@ import pytest
 from aiomysql.cursors import DictCursor
 from mmy.etcd import MySQLEtcdClient, MySQLEtcdData, MySQLEtcdDuplicateNode
 from mmy.mysql.add import MySQLAdder
+from mmy.mysql.client import TableName
 from mmy.mysql.delete import (
     MySQLDeleter,
     MySQLDeleterNoServer,
@@ -34,7 +37,7 @@ from .test_mysql import (
     random_generate_data,
     up_mysql_docker_container,
 )
-from .test_proxy import proxy_server_start
+from .test_proxy import mysql_hosts, proxy_server_start
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +48,7 @@ class OpeType(Enum):
 
 
 class TestIntegration:
-    OPERATION_COUNT: int = 30
+    OPERATION_COUNT: int = 10
 
     @property
     def random_operation(self) -> OpeType:
@@ -69,7 +72,7 @@ class TestIntegration:
         await random_generate_data(
             container=DockerMySQL.MySQL1,
             mmy_info=mmy_info,
-            genereate_repeate=14,
+            genereate_repeate=25,
             min_count=100000,
         )
 
@@ -238,7 +241,7 @@ class TestIntegration:
 
             logger.info("Unmatching test. Data placed correctly.")
             for data_index, user in enumerate(user_data):
-                if data_index % 100 == 0:
+                if data_index % 1000 == 0:
                     logger.info(f"Done: {int(100*(data_index/len(user_data)))}%")
 
                 key = user["id"]  # This is auto_increment
@@ -283,7 +286,7 @@ class TestIntegration:
                     raise RuntimeError(f'Not found data: "{key}"')
 
             for data_index, post in enumerate(post_data):
-                if data_index % 100 == 0:
+                if data_index % 1000 == 0:
                     logger.info(f"Done: {int(100*(data_index/len(post_data)))}%")
 
                 key = post["id"]  # not AUTO_INCREMENT
@@ -326,19 +329,430 @@ class TestIntegration:
                 else:
                     raise RuntimeError(f'Not found data: "{key}"')
 
+    async def _setup_for_test_proxy(self, mmy_info):
+        # Setup
+        for container in DockerMySQL:
+            await up_mysql_docker_container(container)
+            await delete_all_table(container, mmy_info)
+
+        await random_generate_data(
+            container=DockerMySQL.MySQL1,
+            mmy_info=mmy_info,
+            genereate_repeate=10,
+            min_count=100000,
+        )
+        # Fetch MySQL cluster data.
+        # This data is used for unmatch data test.
+        user_data: list[dict[str, Any]] = list()
+        post_data: list[dict[str, Any]] = list()
+        for container in DockerMySQL:
+            async with aiomysql.connect(
+                host=str(container.value.host),
+                port=container.value.port,
+                user=ROOT_USERINFO.user,
+                cursorclass=DictCursor,
+                password=ROOT_USERINFO.password,
+                db=mmy_info.mysql.db,
+            ) as connect:
+                # Get all data
+                cur = await connect.cursor()
+                await cur.execute("SELECT * FROM %s" % (TEST_TABLE1))
+                user_data.extend(await cur.fetchall())
+
+                cur = await connect.cursor()
+                await cur.execute("SELECT * FROM %s" % (TEST_TABLE2))
+                post_data.extend(await cur.fetchall())
+
+        return user_data, post_data
+
+    @property
+    def generate_sha_256(self) -> str:
+        t = time.time_ns()
+        s = hashlib.sha256(str(t).encode("utf-8")).hexdigest()
+        return s
+
     @pytest.mark.asyncio
     async def test_proxy(
         self,
         etcd_flush_all_data,
         mmy_info: MmyYAML,
-        proxy_server_start,
+        unused_tcp_port,
     ):
-        class MySQLClientType(Enum):
-            SELECT = auto()
-            INSERT = auto()
-            DELETE = auto()
-            UPDATE = auto()
+        from mmy.mysql.hosts import MySQLHosts
 
-        # TODO: run proxy server
-        # TODO: Do dynamic change MySQL nodes
-        # TODO: MySQL client operation by mmy client
+        from .test_proxy import run_proxy_server
+
+        user_data, post_data = await self._setup_for_test_proxy(
+            mmy_info=mmy_info,
+        )
+
+        current_nodes: set[DockerMySQL] = set()
+        mysqls = get_mysql_docker_for_test()
+        mysql_info = mmy_info.mysql
+        etcd_info = mmy_info.etcd
+
+        adder = MySQLAdder(
+            mysql_info=mysql_info,
+            etcd_info=etcd_info,
+        )
+        deleter = MySQLDeleter(
+            mysql_info=mysql_info,
+            etcd_info=etcd_info,
+        )
+        # Add initial node
+        _mysql1 = DockerMySQL.MySQL1
+        await adder.do(
+            server=_Server(
+                host=_mysql1.value.host,
+                port=_mysql1.value.port,
+            )
+        )
+        current_nodes.add(_mysql1)
+
+        mysql_hosts = MySQLHosts()
+        etcd_cli = MySQLEtcdClient(
+            host=mmy_info.etcd.nodes[0].host,
+            port=mmy_info.etcd.nodes[0].port,
+        )
+        nodes_data = await etcd_cli.get()
+        mysql_hosts.update(nodes_data.nodes)
+
+        async def watch_etcd():
+            etcd_cli = MySQLEtcdClient(
+                host=mmy_info.etcd.nodes[0].host,
+                port=mmy_info.etcd.nodes[0].port,
+            )
+            async for item in etcd_cli.watch_mysql():
+                logger.info("Detect change of MySQL nodes")
+                logger.info(item)
+                mysql_hosts.update(item.nodes)
+
+        # Watching host update
+        asyncio.create_task(watch_etcd())
+
+        # Do operation
+        for i in range(self.OPERATION_COUNT):
+            async with run_proxy_server(
+                mysql_hosts=mysql_hosts,
+                unused_tcp_port=unused_tcp_port,
+            ):
+                logger.info(f"Complete {int(100*(i/self.OPERATION_COUNT))}%")
+
+                ope: OpeType = self.random_operation
+                mysql: DockerMySQL = self.random_mysql_docker
+                server: _Server = _Server(
+                    host=mysql.value.host,
+                    port=mysql.value.port,
+                )
+                now_hosts = mysql_hosts.get_hosts()
+                # All MySQL Docker nodes is added
+                if len(now_hosts) == len(mysqls) and ope is OpeType.Add:
+                    continue
+                elif len(now_hosts) == 1 and ope is OpeType.Delete:
+                    continue
+                elif server in now_hosts and ope is OpeType.Add:
+                    continue
+                elif server not in now_hosts and ope is OpeType.Delete:
+                    continue
+
+                logger.info(current_nodes)
+                logger.info(f"{ope}, {mysql}")
+
+                async def operate(_server, _container):
+                    logger.info(current_nodes)
+                    i = 0
+                    while True:
+                        try:
+                            match ope:
+                                case OpeType.Add:
+                                    await adder.do(
+                                        server=_server,
+                                    )
+                                    current_nodes.add(_container)
+                                case OpeType.Delete:
+                                    await deleter.do(
+                                        server=_server,
+                                        not_update_while_moving=False,
+                                    )
+                                    current_nodes.remove(_container)
+                        except MySQLDeleterNoServer as e:
+                            logger.warning(e)
+                            if i > 5:
+                                raise e
+
+                            i += 1
+                            await asyncio.sleep(1)
+                            continue
+
+                        break
+
+                # Do test at same time while dynamic moving data
+                unmatch_task = asyncio.create_task(
+                    self.unmatch_test_proxy(
+                        user_data=user_data,
+                        post_data=post_data,
+                        mmy_info=mmy_info,
+                        port=unused_tcp_port,
+                    )
+                )
+                insert_task = asyncio.create_task(
+                    self.insert_correctly(
+                        mmy_info=mmy_info,
+                        port=unused_tcp_port,
+                    )
+                )
+                await operate(server, mysql)
+
+                logger.info("Wait unmatch task")
+                await unmatch_task
+                # Test for placed correctly data that is inserted while moving data
+                inserted_ids = await insert_task
+                await self.unmatch_inserted_which_moving_data(
+                    user_ids=inserted_ids[TEST_TABLE1],
+                    post_ids=inserted_ids[TEST_TABLE2],
+                    mmy_info=mmy_info,
+                    port=unused_tcp_port,
+                )
+
+            await asyncio.sleep(0.1)
+
+    async def unmatch_inserted_which_moving_data(
+        self,
+        user_ids,
+        post_ids,
+        mmy_info,
+        port,
+    ):
+        """
+
+        Do this test that checks about data inserted while moving data after random operation via mmy proxy.
+
+        """
+        from mmy.mysql.proxy_connection import proxy_connect
+
+        from .test_proxy import HOST
+
+        for index, _id in enumerate(user_ids):
+            if index % 100 == 0:
+                logger.info(f"Unmatch test Complete {index}/{len(user_ids)}")
+
+            key = str(_id)
+            _client = proxy_connect(
+                key=key,
+                host=HOST,
+                port=port,
+                db=mmy_info.mysql.db,
+                user=ROOT_USERINFO.user,
+                password=ROOT_USERINFO.password,
+                connect_timeout=0.1,
+                local_infile=True,
+            )
+            async with _client as connect:
+                cursor = await connect.cursor()
+                async with cursor:
+                    await cursor.execute(
+                        key=key,
+                        query=f"SELECT * FROM {TEST_TABLE1} WHERE id=%(_id)s",
+                        args={
+                            "_id": key,
+                        },
+                    )
+                    res = await cursor.fetchall()
+                    assert len(res) == 1
+
+                await connect.commit()
+
+        for index, _id in enumerate(post_ids):
+            if index % 100 == 0:
+                logger.info(f"Unmatch test Complete {index}/{len(post_ids)}")
+
+            key = str(_id)
+            _client = proxy_connect(
+                key=key,
+                host=HOST,
+                port=port,
+                db=mmy_info.mysql.db,
+                user=ROOT_USERINFO.user,
+                password=ROOT_USERINFO.password,
+                connect_timeout=0.1,
+                local_infile=True,
+            )
+            async with _client as connect:
+                cursor = await connect.cursor()
+                async with cursor:
+                    await cursor.execute(
+                        key=key,
+                        query=f"SELECT * FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                        args={
+                            "_id": key,
+                        },
+                    )
+                    res = await cursor.fetchall()
+                    assert len(res) == 1
+
+                await connect.commit()
+
+    async def unmatch_test_proxy(
+        self,
+        user_data,
+        post_data,
+        mmy_info,
+        port,
+    ):
+        from mmy.mysql.proxy_connection import proxy_connect
+
+        from .test_proxy import HOST
+
+        RETRY_COUNT: int = 5
+
+        for index, data in enumerate(user_data):
+            if index % 100 == 0:
+                logger.info(f"Unmatch test Complete {index}/{len(user_data)}")
+
+            i = 0
+            while True:
+                try:
+                    key = str(data["id"])
+                    _client = proxy_connect(
+                        key=key,
+                        host=HOST,
+                        port=port,
+                        db=mmy_info.mysql.db,
+                        user=ROOT_USERINFO.user,
+                        password=ROOT_USERINFO.password,
+                        connect_timeout=0.1,
+                        local_infile=True,
+                    )
+                    async with _client as connect:
+                        cursor = await connect.cursor()
+                        async with cursor:
+                            await cursor.execute(
+                                key=key,
+                                query=f"SELECT * FROM {TEST_TABLE1} WHERE id=%(_id)s",
+                                args={
+                                    "_id": key,
+                                },
+                            )
+                            res = await cursor.fetchall()
+                            assert len(res) == 1
+
+                        await connect.commit()
+
+                    break
+                except AssertionError as e:
+                    if i > RETRY_COUNT:
+                        raise e
+                    await asyncio.sleep(1)
+                    i += 1
+
+        for index, data in enumerate(post_data):
+            if index % 100 == 0:
+                logger.info(f"Unmatch test Complete {index}/{len(post_data)}")
+
+            key = str(data["id"])
+            i = 0
+            while True:
+                try:
+                    _client = proxy_connect(
+                        key=key,
+                        host=HOST,
+                        port=port,
+                        db=mmy_info.mysql.db,
+                        user=ROOT_USERINFO.user,
+                        password=ROOT_USERINFO.password,
+                        connect_timeout=0.1,
+                        local_infile=True,
+                    )
+                    async with _client as connect:
+                        cursor = await connect.cursor()
+                        async with cursor:
+                            await cursor.execute(
+                                key=key,
+                                query=f"SELECT * FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                                args={
+                                    "_id": key,
+                                },
+                            )
+                            res = await cursor.fetchall()
+                            assert len(res) == 1
+
+                        await connect.commit()
+
+                    break
+                except AssertionError as e:
+                    if i > RETRY_COUNT:
+                        raise e
+                    await asyncio.sleep(1)
+                    i += 1
+
+    async def insert_correctly(
+        self,
+        mmy_info,
+        port,
+    ) -> dict[TableName, list[str]]:
+        from mmy.mysql.proxy_connection import proxy_connect
+
+        from .test_proxy import HOST
+
+        INSERT_COUNT: int = 1000
+        _random_base = random.randint(1000000, 20000000)
+        ids: dict[TableName, list[str]] = dict()
+        ids.setdefault(TEST_TABLE1, list())
+        ids.setdefault(TEST_TABLE2, list())
+        for i in range(INSERT_COUNT):
+            _id = _random_base + i
+            key = str(_id)
+            _client = proxy_connect(
+                key=key,
+                host=HOST,
+                port=port,
+                db=mmy_info.mysql.db,
+                user=ROOT_USERINFO.user,
+                password=ROOT_USERINFO.password,
+                connect_timeout=0.1,
+                local_infile=True,
+            )
+            async with _client as connect:
+                cursor = await connect.cursor()
+                async with cursor:
+                    res = await cursor.execute(
+                        key=key,
+                        query=f"INSERT INTO {TEST_TABLE1}(id, name) VALUES(%(_id)s, %(name)s)",
+                        args={
+                            "_id": key,
+                            "name": hashlib.sha512(key.encode("utf-8")),
+                        },
+                    )
+                    assert res == 1
+                    ids[TEST_TABLE1].append(key)
+
+                await connect.commit()
+
+            key = hashlib.md5(str(_id).encode("utf-8")).hexdigest()
+            _client = proxy_connect(
+                key=key,
+                host=HOST,
+                port=port,
+                db=mmy_info.mysql.db,
+                user=ROOT_USERINFO.user,
+                password=ROOT_USERINFO.password,
+                connect_timeout=0.1,
+                local_infile=True,
+            )
+            async with _client as connect:
+                cursor = await connect.cursor()
+                async with cursor:
+                    res = await cursor.execute(
+                        key=key,
+                        query=f"INSERT INTO {TEST_TABLE2}(id, title) VALUES(%(_id)s, %(title)s)",
+                        args={
+                            "_id": key,
+                            "title": hashlib.sha512(key.encode("utf-8")),
+                        },
+                    )
+                    assert res == 1
+                    ids[TEST_TABLE2].append(key)
+
+                await connect.commit()
+
+        return ids

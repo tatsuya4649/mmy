@@ -189,7 +189,7 @@ class MySQLDeleter(Stepper):
         server: _Server,
         ping_type: PingType = PingType.AllServer,
         delete_data: bool = True,
-        sleep_secs_before_datamove_again: int | float = 10,
+        sleep_secs_before_datamove_again: int | float = 60,
         not_update_while_moving: bool = False,
     ):
         """

@@ -3,7 +3,7 @@ from typing import Any, Generator
 
 from uhashring import HashRing
 
-from ..ring import MySQLMetaRing
+from ..ring import MySQLMetaRing, Ring
 from ..server import Server, State, _Server
 
 
@@ -37,10 +37,14 @@ class MySQLHosts(MySQLMetaRing):
                 "instance": _n,
                 "vnodes": self.RING_VNODES,
             }
-            _nodes[self._ring.nodename_from_node(_n)] = _node
+            _nodename = Ring.nodename_from_node(_n)
+            _nodes[_nodename] = _node
             self._address_map[_n.address_format()] = _n.state
             if _n.state is not State.Move:
-                self._ring_witout_move.add_node(_node)
+                self._ring_witout_move.add_node(
+                    _nodename,
+                    _node,
+                )
         self._ring = HashRing(nodes=_nodes)
 
     def get_host(self, key: str) -> Server:

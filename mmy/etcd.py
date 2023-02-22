@@ -170,7 +170,6 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
                 async for chunk in response.aiter_bytes():
                     logger.info("Receive event from %s" % (self._address))
                     jchunk = json.loads(chunk)
-                    logger.info(jchunk)
                     if jchunk.get("error") is not None:
                         logger.error("Occurred error: %s" % (jchunk))
                         break

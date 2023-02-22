@@ -2,6 +2,7 @@ import asyncio
 import logging
 import socketserver
 import struct
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Callable, Coroutine, TypeAlias
@@ -312,7 +313,8 @@ class MySQLProxyContext:
         self._server_reader: asyncio.StreamReader | None = client_reader
         self._server_writer: asyncio.StreamWriter | None = client_writer
         self._key_data: KeyData | None = None
-        self._mysql_hosts: MySQLHosts = mysql_hosts
+        # Make a copy to prevent MySQLHosts from changing from the start to the end of communication
+        self._mysql_hosts: MySQLHosts = deepcopy(mysql_hosts)
         self._handshake: HandShakeV9 | HandShakeV10 | None = None
         self._handshake_version: HandShakeVersion | None = None
         self._direction: MySQLProxyDirection = MySQLProxyDirection.StoC
@@ -1289,12 +1291,11 @@ class MySQLProxyContext:
         return self._key_data
 
     async def release(self):
-        if self._server_writer is not None and not self.server_writer.is_closing:
+        if self._server_writer is not None:
             self.server_writer.close()
             await self.server_writer.wait_closed()
-        if not self._client_writer.is_closing:
-            self._client_writer.close()
-            await self._client_writer.wait_closed()
+        self._client_writer.close()
+        await self._client_writer.wait_closed()
 
 
 async def _proxy_handler(

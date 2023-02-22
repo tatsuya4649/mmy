@@ -12,15 +12,9 @@ from pymysql.err import IntegrityError
 from rich import print
 from uhashring import HashRing
 
-from .mysql.client import (
-    MmyMySQLInfo,
-    MySQLAuthInfoByTable,
-    MySQLClient,
-    MySQLColumns,
-    MySQLFetchAll,
-    MySQLInsertDuplicateBehavior,
-    TableName,
-)
+from .mysql.client import (MmyMySQLInfo, MySQLAuthInfoByTable, MySQLClient,
+                           MySQLColumns, MySQLFetchAll,
+                           MySQLInsertDuplicateBehavior, TableName)
 from .mysql.errcode import MySQLErrorCode
 from .mysql.sql import SQLPoint, _Point, _SQLPoint
 from .server import Server, State, _Server
@@ -174,7 +168,8 @@ class Ring(RingHandler):
     def __len__(self) -> int:
         return len(self._node_hash)
 
-    def nodename_from_node(self, node: Server) -> str:
+    @classmethod
+    def nodename_from_node(cls, node: Server) -> str:
         return f"%s:%d" % (str(node.host), node.port)
 
     def ring_node_count(self) -> int:

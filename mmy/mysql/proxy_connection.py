@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import struct
 import warnings
 
@@ -13,11 +14,12 @@ from pymysql.err import InternalError, OperationalError
 from rich import print
 
 from ..const import SYSTEM_NAME
-from .client_log import client_logger
 from .hosts import MySQLHostBroken
 from .proxy import KeyData
 from .proxy_cursors import DictCursor
 from .proxy_protocol import MmyPacket
+
+logger = logging.getLogger(__name__)
 
 
 def proxy_connect(
@@ -119,7 +121,7 @@ class ProxyConnection(Connection):
 
         chunk_size = min(connections.MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
 
-        client_logger.debug("Send command: [%d] %s", command, sql)
+        logger.debug("Send command: [%d] %s", command, sql)
         prelude = struct.pack("<iB", chunk_size, command)
         self._write_bytes(prelude + sql[: chunk_size - 1])
         # logger.debug(dump_packet(prelude + sql))
@@ -138,7 +140,7 @@ class ProxyConnection(Connection):
 
     async def _write_key_data(self):
         _b: bytes = self._key_data.to_bytes()
-        client_logger.debug(f"Write KeyData: {len(_b)}")
+        logger.debug(f"Write KeyData: {len(_b)}")
         self._writer.write(_b)
         await self._writer.drain()
 
@@ -159,11 +161,9 @@ class ProxyConnection(Connection):
 
             btrl, btrh, packet_number = struct.unpack("<HBB", packet_header)
             bytes_to_read = btrl + (btrh << 16)
-            client_logger.debug(
-                f"Receive packet: {bytes_to_read}bytes, ID: {packet_number}"
-            )
+            logger.debug(f"Receive packet: {bytes_to_read}bytes, ID: {packet_number}")
             if bytes_to_read == 0 and packet_number == 255:
-                client_logger.debug("Received mmy broken host packet")
+                logger.debug("Received mmy broken host packet")
                 raise MySQLHostBroken
 
             # Outbound and inbound packets are numbered sequentialy, so
@@ -217,12 +217,10 @@ class ProxyConnection(Connection):
             "<iIB23s", self.client_flag, connections.MAX_PACKET_LEN, charset_id, b""
         )
 
-        client_logger.debug(f"MySQL serevr: capabilities: {self.server_capabilities}")
-        client_logger.debug(
-            f"\tSupport SSL: {bool(self.server_capabilities & CLIENT.SSL)}"
-        )
+        logger.debug(f"MySQL serevr: capabilities: {self.server_capabilities}")
+        logger.debug(f"\tSupport SSL: {bool(self.server_capabilities & CLIENT.SSL)}")
         if self._ssl_context and self.server_capabilities & CLIENT.SSL:
-            client_logger.debug(f"TLS/SSL")
+            logger.debug(f"TLS/SSL")
             self.write_packet(data_init)
 
             # Stop sending events to data_received
@@ -259,7 +257,7 @@ class ProxyConnection(Connection):
             # Contains the auth plugin from handshake
             auth_plugin = self._server_auth_plugin
 
-        client_logger.debug(auth_plugin)
+        logger.debug(auth_plugin)
         if auth_plugin in ("", "mysql_native_password"):
             authresp = pymysql._auth.scramble_native_password(
                 self._password.encode("latin1"), self.salt
@@ -314,11 +312,11 @@ class ProxyConnection(Connection):
                 connect_attrs += struct.pack("B", len(v)) + v
             data += struct.pack("B", len(connect_attrs)) + connect_attrs
 
-        client_logger.debug("Send to Handshake Response packet")
+        logger.debug("Send to Handshake Response packet")
         self.write_packet(data)
-        client_logger.debug("Wait for response from MySQL server")
+        logger.debug("Wait for response from MySQL server")
         auth_packet = await self._read_packet()
-        client_logger.debug(f"Received auth packet: {auth_packet}")
+        logger.debug(f"Received auth packet: {auth_packet}")
 
         # if authentication method isn't accepted the first byte
         # will have the octet 254
