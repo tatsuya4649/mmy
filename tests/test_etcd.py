@@ -6,9 +6,6 @@ from enum import Enum
 
 import pytest
 import pytest_asyncio
-from python_on_whales import Container, docker
-from rich import print
-
 from mmy.etcd import (
     EtcdConnectError,
     EtcdPingError,
@@ -17,6 +14,8 @@ from mmy.etcd import (
     MySQLEtcdDuplicateNode,
 )
 from mmy.server import Server, State, _Server
+from python_on_whales import Container, docker
+from rich import print
 
 from .docker import DockerStartupError, container
 from .test_mysql import DockerMySQL
@@ -166,6 +165,9 @@ async def up_etcd_docker_containers():
 
 def break_etcd_container(container: DockerEtcd):
     ps = docker.compose.ps([container.value.service_name])
+    if len(ps) == 0:
+        return
+
     psf: Container = ps[0]
     if psf.state.running is False:
         raise RuntimeError(f'Already not running: "{container.value.service_name}"')
@@ -173,7 +175,7 @@ def break_etcd_container(container: DockerEtcd):
     assert psf.state.running is False
 
 
-def restore_container(container: DockerEtcd):
+def restore_etcd_container(container: DockerEtcd):
     docker.compose.start(container.value.service_name)
     pass
 

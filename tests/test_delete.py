@@ -17,7 +17,7 @@ from mmy.ring import MySQLRing
 from mmy.server import Server, State, _Server
 from rich import print
 
-from ._mysql import ROOT_USERINFO, TEST_TABLE1, TEST_TABLE2, mmy_info
+from ._mysql import ROOT_USERINFO, TEST_TABLE2, mmy_info
 from .test_etcd import etcd_flush_all_data, etcd_put_mysql_container
 from .test_mysql import (
     DockerMySQL,
@@ -102,12 +102,6 @@ class TestDelete:
             ) as connect:
                 # Delete all table data from container
                 await delete_all_table(container, mmy_info)
-                cur = await connect.cursor()
-                await cur.execute(
-                    "CALL generate_random_user(%d, %d)"
-                    % (self.GENERAETE_REPEAT, self.MIN_COUNT)
-                )
-                await connect.commit()
 
                 cur = await connect.cursor()
                 await cur.execute(
@@ -168,10 +162,6 @@ class TestDelete:
             ) as connect:
                 # Get all data
                 cur = await connect.cursor()
-                await cur.execute("SELECT * FROM %s" % (TEST_TABLE1))
-                user_data.extend(await cur.fetchall())
-
-                cur = await connect.cursor()
                 await cur.execute("SELECT * FROM %s" % (TEST_TABLE2))
                 post_data.extend(await cur.fetchall())
 
@@ -199,7 +189,6 @@ class TestDelete:
 
             logger.info(f"Inconsistency test1")
             # Inconsistency test1: Total rows count
-            delete_after_user_count: int = 0
             delete_after_post_count: int = 0
             for container in mysql_containers:
                 logger.info(container.value.service_name)
@@ -213,61 +202,21 @@ class TestDelete:
                 ) as connect:
                     cur = await connect.cursor()
                     await cur.execute(
-                        "SELECT COUNT(*) as user_count FROM %s" % (TEST_TABLE1)
-                    )
-                    _user_count = await cur.fetchone()
-                    assert _user_count is not None
-
-                    user_count: int = _user_count["user_count"]
-                    delete_after_user_count += user_count
-                    cur = await connect.cursor()
-                    await cur.execute(
                         "SELECT COUNT(*) as post_count FROM %s" % (TEST_TABLE2)
                     )
                     _post_count = await cur.fetchone()
                     assert _post_count is not None
                     post_count: int = _post_count["post_count"]
                     delete_after_post_count += post_count
-                    logger.info(f"user_count: {user_count}")
                     logger.info(f"post_count: {post_count}")
 
-            logger.info(f"Inserted test data: {TEST_TABLE1}, {TEST_TABLE2}")
-            logger.info(f"\tbefore user_count: {delete_before_user_count}")
+            logger.info(f"Inserted test data: {TEST_TABLE2}")
             logger.info(f"\tbefore post_count: {delete_before_post_count}")
-            logger.info(f"\tafter user_count: {delete_after_user_count}")
             logger.info(f"\tafter post_count: {delete_after_post_count}")
-            assert delete_after_user_count == delete_before_user_count
             assert delete_after_post_count == delete_before_post_count
 
         # Incosistency test2: only one data
         # Check same data on multiple MySQL nodes
-        logger.info("Inconsistency test with user datas")
-        for data_index, item in enumerate(user_data):
-            if data_index % 100 == 0:
-                logger.info(f"Done: {data_index/len(user_data)}")
-
-            i = 0
-            for container in mysql_containers:
-                async with aiomysql.connect(
-                    host=str(container.value.host),
-                    port=container.value.port,
-                    user=ROOT_USERINFO.user,
-                    cursorclass=DictCursor,
-                    password=ROOT_USERINFO.password,
-                    db=mmy_info.mysql.db,
-                ) as connect:
-                    cur = await connect.cursor()
-                    await cur.execute(
-                        f"SELECT COUNT(*) as count FROM {TEST_TABLE1} WHERE md5=%(md5)s",
-                        {
-                            "md5": item["md5"],
-                        },
-                    )
-                    _f = await cur.fetchone()
-                    i += _f["count"]
-
-            assert i == 1
-
         logger.info("Inconsistency test with post datas")
         for data_index, item in enumerate(post_data):
             if data_index % 100 == 0:
@@ -323,15 +272,10 @@ class TestDelete:
             ) as connect:
                 # Get all data
                 cur = await connect.cursor()
-                await cur.execute("SELECT * FROM %s" % (TEST_TABLE1))
-                user_data.extend(await cur.fetchall())
-
-                cur = await connect.cursor()
                 await cur.execute("SELECT * FROM %s" % (TEST_TABLE2))
                 post_data.extend(await cur.fetchall())
 
-        logger.info(f"Inserted test data: {TEST_TABLE1}, {TEST_TABLE2}")
-        logger.info(f"Before user_count: {len(user_data)}")
+        logger.info(f"Inserted test data: {TEST_TABLE2}")
         logger.info(f"Before post_count: {len(post_data)}")
 
         cons = get_mysql_docker_for_test()
@@ -369,51 +313,6 @@ class TestDelete:
                 ],
                 insert_duplicate_behavior=MySQLInsertDuplicateBehavior.Raise,
             )
-
-            logger.info(f"Inconsistency test about init {TEST_TABLE1} data")
-            for data_index, user in enumerate(user_data):
-                if data_index % 100 == 0:
-                    logger.info(f"Done: {data_index/len(user_data)}")
-
-                key = user["id"]  # This is auto_increment
-                check_key = user["md5"]
-                nodeinfo = ring.get(key)
-                instance = nodeinfo["instance"]
-
-                for con in cons[index + 1 :]:
-                    try:
-                        async with aiomysql.connect(
-                            host=str(con.value.host),
-                            port=con.value.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            await cur.execute(
-                                f"SELECT COUNT(*) as count FROM {TEST_TABLE1} WHERE md5=%(md5)s",
-                                {
-                                    "md5": check_key,
-                                },
-                            )
-                            _f = await cur.fetchone()
-                            assert _f["count"] == 1
-
-                            if not (
-                                con.value.host == instance.host
-                                and con.value.port == instance.port
-                            ):
-                                raise RuntimeError(
-                                    f"Data({check_key}) must be in {instance.address_format()} but, in {con.value.address_format}"
-                                )
-                            else:
-                                break  # Pass
-                    except AssertionError:
-                        continue
-
-                else:
-                    raise RuntimeError(f'Not found data: "{key}"')
 
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
             for data_index, post in enumerate(post_data):
@@ -485,13 +384,6 @@ class TestDelete:
             ) as connect:
                 # Delete all table data from container
                 await delete_all_table(container, mmy_info)
-
-                cur = await connect.cursor()
-                await cur.execute(
-                    "CALL generate_random_user(%d, %d)"
-                    % (self.GENERAETE_REPEAT, self.MIN_COUNT)
-                )
-                await connect.commit()
 
                 cur = await connect.cursor()
                 await cur.execute(
@@ -622,14 +514,6 @@ class TestDelete:
                             cur = await connect.cursor()
                             async with cur:
                                 await cur.execute(
-                                    f"INSERT INTO {TEST_TABLE1}(id, name, md5) VALUES (%s, %s, %s)",
-                                    ((_id, _name, _md5)),
-                                )
-                            await connect.commit()
-
-                            cur = await connect.cursor()
-                            async with cur:
-                                await cur.execute(
                                     f"INSERT INTO {TEST_TABLE2}(id, title, md5) VALUES (%s, %s, %s)",
                                     ((_id, _name, _md5)),
                                 )
@@ -664,12 +548,6 @@ class TestDelete:
                     # Get all data
                     cur = await connect.cursor()
                     await cur.execute(
-                        "SELECT COUNT(*) as count FROM %s" % (TEST_TABLE1)
-                    )
-                    res = await cur.fetchone()
-                    before_delete_user_count += res["count"]
-                    cur = await connect.cursor()
-                    await cur.execute(
                         "SELECT COUNT(*) as count FROM %s" % (TEST_TABLE2)
                     )
                     res = await cur.fetchone()
@@ -694,12 +572,6 @@ class TestDelete:
                     # Get all data
                     cur = await connect.cursor()
                     async with cur:
-                        await cur.execute("SELECT * FROM %s" % (TEST_TABLE1))
-                        res = await cur.fetchall()
-                        user_data.extend(res)
-
-                    cur = await connect.cursor()
-                    async with cur:
                         await cur.execute("SELECT * FROM %s" % (TEST_TABLE2))
                         res = await cur.fetchall()
                         post_data.extend(res)
@@ -715,11 +587,6 @@ class TestDelete:
 
                 # Get all data
                 cur = await connect.cursor()
-                await cur.execute("SELECT COUNT(*) as count FROM %s" % (TEST_TABLE1))
-                res = await cur.fetchone()
-                assert res["count"] == 0
-
-                cur = await connect.cursor()
                 await cur.execute("SELECT COUNT(*) as count FROM %s" % (TEST_TABLE2))
                 res = await cur.fetchone()
                 assert res["count"] == 0
@@ -728,50 +595,6 @@ class TestDelete:
             assert before_delete_post_count + COUNT == len(post_data)
 
             ring = deleter.ring
-            logger.info(f"Inconsistency test about init {TEST_TABLE1} data")
-            for data_index, user in enumerate(user_data):
-                if data_index % 100 == 0:
-                    logger.info(f"Done: {int(100*data_index/len(user_data))}%")
-
-                key = user["id"]  # This is auto_increment
-                nodeinfo = ring.get(key)
-                instance = nodeinfo["instance"]
-
-                for con in cons:
-                    try:
-                        async with aiomysql.connect(
-                            host=str(con.value.host),
-                            port=con.value.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            await cur.execute(
-                                f"SELECT COUNT(*) as count FROM {TEST_TABLE1} WHERE id=%(id)s",
-                                {
-                                    "id": key,
-                                },
-                            )
-                            _f = await cur.fetchone()
-                            assert _f["count"] == 1
-
-                            if not (
-                                con.value.host == instance.host
-                                and con.value.port == instance.port
-                            ):
-                                raise RuntimeError(
-                                    f"Data({key}) must be in {instance.address_format()} but, in {con.value.address_format}"
-                                )
-                            else:
-                                break  # Pass
-                    except AssertionError:
-                        continue
-
-                else:
-                    raise RuntimeError(f'Not found data: "{key}"')
-
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
             for data_index, post in enumerate(post_data):
                 if data_index % 100 == 0:
@@ -782,36 +605,26 @@ class TestDelete:
                 instance = nodeinfo["instance"]
 
                 for con in cons:
-                    try:
-                        async with aiomysql.connect(
-                            host=str(con.value.host),
-                            port=con.value.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            await cur.execute(
-                                f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
-                                {
-                                    "_id": key,
-                                },
-                            )
-                            _f = await cur.fetchone()
-                            assert _f["count"] == 1
-
-                            if not (
-                                con.value.host == instance.host
-                                and con.value.port == instance.port
-                            ):
-                                raise RuntimeError(
-                                    f"Data({key}) must be in {instance.address_format()} but, in {con.value.address_format}"
-                                )
-                            else:
-                                break  # Pass
-                    except AssertionError:
-                        continue
-
-                else:
-                    raise RuntimeError(f'Not found data: "{key}"')
+                    async with aiomysql.connect(
+                        host=str(con.value.host),
+                        port=con.value.port,
+                        user=ROOT_USERINFO.user,
+                        cursorclass=DictCursor,
+                        password=ROOT_USERINFO.password,
+                        db=mmy_info.mysql.db,
+                    ) as connect:
+                        cur = await connect.cursor()
+                        await cur.execute(
+                            f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                            {
+                                "_id": key,
+                            },
+                        )
+                        _f = await cur.fetchone()
+                        if not (
+                            con.value.host == instance.host
+                            and con.value.port == instance.port
+                        ):
+                            assert len(res) == 1
+                        else:
+                            assert len(res) == 0

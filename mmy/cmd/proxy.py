@@ -1,15 +1,15 @@
 import asyncio
 import logging
 import os
+from pprint import pformat
 
 import click
 import httpx
-
 from mmy.const import SYSTEM_NAME
-from mmy.etcd import MySQLEtcdClient, MySQLEtcdData
+from mmy.etcd import EtcdError, EtcdPingError, MySQLEtcdClient, MySQLEtcdData
 from mmy.monitor import MmyMonitor
 from mmy.mysql.hosts import MySQLHosts
-from mmy.mysql.proxy import run_proxy_server
+from mmy.mysql.proxy import ProxyServer
 from mmy.parse import MmyMySQLInfo, MmyYAML, parse_yaml
 from mmy.server import _Server, address_from_server
 
@@ -38,20 +38,36 @@ async def monitoring_mysql_servers(
 
 async def etcd_management(
     mysql_hosts: MySQLHosts,
-    etcd: _Server,
+    etcd_data: MySQLEtcdData,
 ):
     logger.info("Start managing MySQL cluster and watching change about it")
 
-    cli = MySQLEtcdClient(
-        scheme="http",
-        host=etcd.host,
-        port=etcd.port,
-    )
-    async for item in cli.watch_mysql():
-        mysql_hosts.update(item.nodes)
+    while True:
+        await asyncio.sleep(0.5)
+        for node in etcd_data.nodes:
+            logger.info(f"Watching event on etcd node({node.address_format()})")
+            try:
+                cli = MySQLEtcdClient(
+                    scheme="http",
+                    host=node.host,
+                    port=node.port,
+                )
+                async for item in cli.watch_mysql():
+                    logger.info(item)
+                    logger.info(
+                        f"Received event on etcd: {pformat([i.address_format() for i in item.nodes])}"
+                    )
+                    mysql_hosts.update(item.nodes)
+
+            except EtcdPingError:
+                logger.error(f"etcd ping error: {node.address_format()}")
+            except EtcdError as e:
+                logger.error(e)
+            except Exception as e:
+                logger.error(e)
 
 
-async def check_mysql(etcd: _Server):
+async def check_mysql(mysql_hosts: MySQLHosts, etcd: _Server):
     logger.debug("Test MySQL servers on etcd")
     try:
         client = MySQLEtcdClient(
@@ -63,6 +79,7 @@ async def check_mysql(etcd: _Server):
         if len(data.nodes) == 0:
             logger.warning(f"No MySQL server. Please add it with controller.")
         else:
+            mysql_hosts.update(data.nodes)
             logger.info(
                 f"MySQL servers. {[address_from_server(i) for i in data.nodes]}"
             )
@@ -114,32 +131,35 @@ def _main(
     logger.info("Etcd host: %s" % (etcd_host))
     logger.info("Etcd port: %s" % (etcd_port))
 
+    mysql_hosts = MySQLHosts()
     loop = asyncio.new_event_loop()
     etcd_server = _Server(
         host=etcd_host,
         port=etcd_port,
     )
     loop.run_until_complete(
+        # Get initial MySQL node
         check_mysql(
+            mysql_hosts=mysql_hosts,
             etcd=etcd_server,
         )
     )
 
-    mysql_hosts = MySQLHosts()
     mmy_yaml: MmyYAML = parse_yaml(config_path)
 
     async def _p():
+        proxy_server = ProxyServer(
+            mysql_hosts=mysql_hosts,
+            host=host,
+            port=port,
+            connection_timeout=connection_timeout,
+            command_timeout=command_timeout,
+        )
         await asyncio.gather(
-            run_proxy_server(
-                mysql_hosts=mysql_hosts,
-                host=host,
-                port=port,
-                connection_timeout=connection_timeout,
-                command_timeout=command_timeout,
-            ),
+            proxy_server.serve(),
             etcd_management(
                 mysql_hosts=mysql_hosts,
-                etcd=etcd_server,
+                etcd_data=mmy_yaml.etcd,
             ),
             monitoring_mysql_servers(
                 mysql_hosts=mysql_hosts,

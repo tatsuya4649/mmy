@@ -1320,11 +1320,12 @@ async def _proxy_handler(
         try:
             await ctx.initial_fetch_keydata()
         except asyncio.TimeoutError:
-            logger.debug("Timeout error on Initial KeyData")
+            logger.error("Timeout error on Initial KeyData")
             return
         except ProxyInvalidRequest:
             logger.debug("Invalid request")
             return
+
         try:
             await ctx.select_server()
         except MySQLHostBroken:
@@ -1338,12 +1339,16 @@ async def _proxy_handler(
                 ctx.connection_phase(),
                 timeout=connection_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.error("Timeout error: Connection phase")
+            return
 
+        try:
             await ctx.command_phase(
                 command_timeout=command_timeout,
             )
         except asyncio.TimeoutError:
-            logger.debug("Timeout error in KeyData")
+            logger.error("Timeout error: Command phase")
             return
 
         logger.debug("End proxy handler")
@@ -1420,6 +1425,7 @@ class ProxyServer:
         self._servers: list[asyncio.Server] = list()
 
     async def serve(self):
+        logger.info("Start serving")
         server: asyncio.Server = await asyncio.start_server(
             lambda r, w: proxy_handler(
                 mysql_hosts=self._mysql_hosts,

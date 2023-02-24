@@ -4,8 +4,6 @@ import logging
 from cmd import Cmd
 
 import click
-from rich import print
-
 from mmy.etcd import MmyEtcdInfo, MySQLEtcdClient, MySQLEtcdNotFoundNode
 from mmy.mysql.add import MySQLAdder
 from mmy.mysql.client import MmyMySQLInfo
@@ -13,6 +11,7 @@ from mmy.mysql.delete import MySQLDeleter
 from mmy.parse import MmyYAML, parse_yaml
 from mmy.server import _Server, address_from_server
 from mmy.state import state_main
+from rich import print
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +82,14 @@ def add_main(
     return
 
 
+def reshard_main(
+    line: str,
+    mysql_info: MmyMySQLInfo,
+    etcd_info: MmyEtcdInfo,
+):
+    return
+
+
 class MySQLCmd(Cmd):
     prompt = "mysql) "
 
@@ -118,6 +125,13 @@ class MySQLCmd(Cmd):
 
     def help_delete(self):
         print("Delete MySQL node from it's cluster")
+
+    # About reshard
+    def do_reshard(self, line: str):
+        reshard_main(line, self._mysql_info, self._etcd_info)
+
+    def help_reshard(self):
+        print("Reshard all data on MySQL cluster")
 
     def do_EOF(self, line: str):
         print("[bold]Bye[/bold]")

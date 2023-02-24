@@ -6,15 +6,21 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Coroutine
+from typing import Any, Callable, Coroutine
 
 from pymysql.err import IntegrityError
 from rich import print
 from uhashring import HashRing
 
-from .mysql.client import (MmyMySQLInfo, MySQLAuthInfoByTable, MySQLClient,
-                           MySQLColumns, MySQLFetchAll,
-                           MySQLInsertDuplicateBehavior, TableName)
+from .mysql.client import (
+    MmyMySQLInfo,
+    MySQLAuthInfoByTable,
+    MySQLClient,
+    MySQLColumns,
+    MySQLFetchAll,
+    MySQLInsertDuplicateBehavior,
+    TableName,
+)
 from .mysql.errcode import MySQLErrorCode
 from .mysql.sql import SQLPoint, _Point, _SQLPoint
 from .server import Server, State, _Server
@@ -147,9 +153,11 @@ def reset_from_to_parameter(func):
     return _inner
 
 
-class Ring(RingHandler):
+class RingMeta:
     LENGTH: int = 4
 
+
+class Ring(RingMeta, RingHandler):
     def __init__(
         self,
         init_nodes: list[Server] = list(),
@@ -186,6 +194,9 @@ class Ring(RingHandler):
 
     def get(self, data: Any):
         return self._hr.get(data)
+
+    def get_instance(self, data: Any):
+        return self._hr.get_node_instance(data)
 
     def logring(self):
         DELIMITER_COUNT = 50
@@ -428,6 +439,7 @@ class Ring(RingHandler):
             self._from_to.append(mdp)
             _cos.append(self._move(mdp))
 
+        assert len(_cos) == self._default_vnodes
         return _cos
 
     @reset_from_to_parameter
@@ -516,6 +528,7 @@ class Ring(RingHandler):
             """
 
             D : Deleted node
+            P : Prev node
             |> : Greater than
             =| : Less than or equal
 
@@ -571,6 +584,23 @@ class Ring(RingHandler):
 
             0x00..00       N       P       0xff..ff
                 * ---------*--------*--------- *
+
+        Ex4.
+
+            Before:
+
+             0x00..00 D  D N       P   D   D   0xff..ff
+                * ----*--*-*-------*---*---*------ *
+                                   |>-----=|
+                                       |
+                           ____________| Owner of "D" node.
+                           | 
+                           |  Move to next
+                           |    
+            After:         |    
+                           |
+            0x00..00  D  D N                   0xff..ff
+                * ----*--*-*---------------------- *
 
             """
             first_deleted: _Point = _Point(deleted_items[0])
@@ -633,6 +663,7 @@ class Ring(RingHandler):
             )
             _cos.append(self._move(mdp))
 
+        assert len(_cos) == self._default_vnodes
         return _cos
 
     async def _move(self, mdp: MDP) -> MovedData | None:
@@ -658,7 +689,7 @@ class Ring(RingHandler):
             )
         )
 
-    def not_owner_points(self, node: Server) -> list[Md]:
+    def _get_points(self, node: Server, fn: Callable[[Server, Server], bool]):
         points: list[tuple[str, str]] = self._hr.get_points()
         res: list[Md] = list()
 
@@ -666,7 +697,7 @@ class Ring(RingHandler):
             _prev_point, _ = points[index - 1]
             _point, nodename = point
             _node: Server = self._node_hash[nodename]
-            if _node != node:
+            if fn(node, _node) is True:
                 _from: Md = Md(
                     node=_node,
                     start_point=_Point(_prev_point),
@@ -678,6 +709,18 @@ class Ring(RingHandler):
                 res.append(_from)
 
         return res
+
+    def owner_points(self, node: Server) -> list[Md]:
+        return self._get_points(
+            node=node,
+            fn=lambda x, y: x == y,
+        )
+
+    def not_owner_points(self, node: Server) -> list[Md]:
+        return self._get_points(
+            node=node,
+            fn=lambda x, y: x != y,
+        )
 
     @property
     def from_to_data(self) -> list[MDP]:
@@ -740,13 +783,13 @@ class MySQLRing(
                 table=tablename,
                 start=SQLPoint(
                     point=_from.start_point,
-                    equal=False,
+                    equal=_from.start_equal,
                     greater=True,
                     less=False,
                 ),
                 end=SQLPoint(
                     point=_from.end_point,
-                    equal=True,
+                    equal=_from.end_equal,
                     greater=False,
                     less=True,
                 ),

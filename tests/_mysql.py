@@ -1,11 +1,10 @@
 import os
 
+import aiomysql
 import pytest
-
 from mmy.mysql.client import MySQLAuthInfo, TableName
 from mmy.parse import MmyYAML, parse_yaml
 
-TEST_TABLE1: TableName = TableName("user")
 TEST_TABLE2: TableName = TableName("post")
 
 
@@ -25,3 +24,23 @@ ROOT_USERINFO = MySQLAuthInfo(
     user="root",
     password="root",
 )
+
+
+async def delete_all_table(
+    container,
+    mmy_info: MmyYAML,
+):
+    async with aiomysql.connect(
+        host=str(container.value.host),
+        port=container.value.port,
+        user=ROOT_USERINFO.user,
+        password=ROOT_USERINFO.password,
+        db=mmy_info.mysql.db,
+    ) as connect:
+        cur = await connect.cursor()
+        await cur.execute("DELETE FROM %s" % (TEST_TABLE2))
+        await connect.commit()
+
+        cur = await connect.cursor()
+        await cur.execute("ALTER TABLE `%s`  AUTO_INCREMENT = 1" % (TEST_TABLE2))
+        await connect.commit()

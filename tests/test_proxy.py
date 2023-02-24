@@ -6,12 +6,14 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pprint import pformat
 from typing import Any
 
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from mmy.etcd import MySQLEtcdClient
 from mmy.mysql.hosts import MySQLHostBroken, MySQLHosts
 from mmy.mysql.proxy import ProxyServer
 from mmy.mysql.proxy_connection import ProxyConnection, proxy_connect
@@ -20,8 +22,8 @@ from mmy.server import Server, State, _Server
 from python_on_whales import docker
 from rich import print
 
-from ._mysql import TEST_TABLE1
-from .test_mysql import DockerMySQL, container
+from ._mysql import TEST_TABLE2, mmy_info
+from .test_mysql import DockerMySQL, container, up_mysql_docker_container
 
 HOST = "127.0.0.1"
 PROXY_SERVER_STARTUP_TIMEOUT: int = 10
@@ -209,7 +211,7 @@ def create_client_certificate():
         )
 
 
-def fix_proxy_connect(key: str, port: int):
+def fix_proxy_connect(key: str, port: int, timeout: float | int = 0.1):
     _client: ProxyConnection = proxy_connect(
         key=key,
         host=HOST,
@@ -217,7 +219,7 @@ def fix_proxy_connect(key: str, port: int):
         db="test",
         user="root",
         password="root",
-        connect_timeout=0.1,
+        connect_timeout=timeout,
         local_infile=True,
     )
     return _client
@@ -267,7 +269,7 @@ async def test_select(
             length = 100
             await cursor.execute(
                 key=random_key,
-                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE1, length),
+                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE2, length),
             )
             res = await cursor.fetchall()
             assert isinstance(res, list)
@@ -285,7 +287,7 @@ async def test_insert(
         async with cursor:
             res = await cursor.execute(
                 key=random_key,
-                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE1, random_key),
+                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE2, random_key),
             )
             assert res == 1
 
@@ -315,7 +317,7 @@ async def test_insert_many(
                 res = await cursor.execute(
                     key=_rk,
                     query="INSERT INTO %s (id, name) VALUES (%s, %s)"
-                    % (TEST_TABLE1, _rk, _rk),
+                    % (TEST_TABLE2, _rk, _rk),
                 )
                 assert res == 1
 
@@ -326,7 +328,7 @@ async def test_insert_many(
             async with cursor:
                 await cursor.execute(
                     key=_rk,
-                    query="SELECT * FROM %s WHERE id=%s" % (TEST_TABLE1, _rk),
+                    query="SELECT * FROM %s WHERE id=%s" % (TEST_TABLE2, _rk),
                 )
                 res = len(await cursor.fetchall())
                 assert res == 1
@@ -345,7 +347,7 @@ async def test_update(
             res = await cursor.execute(
                 key=str(random_id),
                 query="INSERT INTO %s (id, name) VALUES (%d, %s)"
-                % (TEST_TABLE1, random_id, str(random_key)),
+                % (TEST_TABLE2, random_id, str(random_key)),
             )
             assert res == 1
 
@@ -353,7 +355,7 @@ async def test_update(
             res = await cursor.execute(
                 key=str(random_key),
                 query="UPDATE %s SET name=%s WHERE id=%d"
-                % (TEST_TABLE1, new_name, random_id),
+                % (TEST_TABLE2, new_name, random_id),
             )
             assert res == 1
 
@@ -380,7 +382,7 @@ async def test_update_many(
                 res = await cursor.execute(
                     key=_rk,
                     query="INSERT INTO %s (id, name) VALUES (%s, %s)"
-                    % (TEST_TABLE1, _rk, _rk),
+                    % (TEST_TABLE2, _rk, _rk),
                 )
                 assert res == 1
 
@@ -393,7 +395,7 @@ async def test_update_many(
             async with cursor:
                 await cursor.execute(
                     key=_rk,
-                    query="UPDATE %s SET name=%s" % (TEST_TABLE1, _nrk),
+                    query="UPDATE %s SET name=%s" % (TEST_TABLE2, _nrk),
                 )
                 res = len(await cursor.fetchall())
                 assert res == 1
@@ -410,7 +412,7 @@ async def test_delete(
         async with cursor:
             res = await cursor.execute(
                 key=random_key,
-                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE1, random_key),
+                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE2, random_key),
             )
             assert res == 1
 
@@ -420,7 +422,7 @@ async def test_delete(
         async with cursor:
             res = await cursor.execute(
                 key=random_key,
-                query="DELETE FROM %s WHERE name=%s" % (TEST_TABLE1, random_key),
+                query="DELETE FROM %s WHERE name=%s" % (TEST_TABLE2, random_key),
             )
             assert res == 1
 
@@ -441,20 +443,20 @@ async def test_delete_many(
         async with cursor:
             await cursor.execute(
                 key=_rk,
-                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE1, count),
+                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE2, count),
             )
             selects.extend(await cursor.fetchall())
 
-    for row in selects:
-        if i % 100 == 0:
-            logger.info(f"Complete: {int(100*(i/count))}%")
+    for index, row in enumerate(selects):
+        if index % 100 == 0:
+            logger.info(f"Complete: {int(100*(index/count))}%")
 
         async with fix_proxy_connect(_rk, proxy_server_start) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 res = await cursor.execute(
                     key=_rk,
-                    query="DELETE FROM %s WHERE id=%s" % (TEST_TABLE1, row["id"]),
+                    query="DELETE FROM %s WHERE id=%s" % (TEST_TABLE2, row["id"]),
                 )
                 assert res == 1
 
@@ -488,11 +490,11 @@ async def test_load_infile(
         cursor = await connect.cursor()
         async with cursor:
             resource_dirs = os.path.join(os.path.dirname(__file__), "resources")
-            resource_user = os.path.join(resource_dirs, "user.csv")
+            resource_user = os.path.join(resource_dirs, "post.csv")
             with pytest.raises(MmyLocalInfileUnsupportError):
                 await cursor.execute(
                     key=random_key,
-                    query='LOAD DATA LOCAL INFILE "%s" INTO TABLE user FIELDS TERMINATED BY "," (@1) SET name=@1'
+                    query='LOAD DATA LOCAL INFILE "%s" INTO TABLE post FIELDS TERMINATED BY "," (@1) SET name=@1'
                     % (resource_user),
                 )
 
@@ -565,3 +567,176 @@ async def test_broken_host_on_command_phase(
                     key=random_key,
                     query="SHOW VARIABLES LIKE 'time_zone'",
                 )
+
+
+@pytest.mark.asyncio
+async def test_update_etcd_data(
+    up_etcd_docker_containers,
+    unused_tcp_port: int,
+    mmy_info,
+):
+    import random
+
+    from mmy.cmd.proxy import etcd_management
+    from mmy.etcd import MySQLEtcdData
+    from pymysql.err import OperationalError
+
+    from .test_etcd import DockerEtcd
+    from .test_mysql import get_mysql_docker_for_test, up_mysql_docker_container
+
+    mysql_hosts = MySQLHosts()
+
+    COUNT = 1000
+    RETRY_COUNT = 4
+    RETRY_INTERVAL = 2
+
+    async def _do_update_etcd_data():
+        etcds = list(DockerEtcd)
+        mysqls = list(DockerMySQL)
+        for node in etcds:
+            try:
+                cli = MySQLEtcdClient(
+                    host=node.value.host,
+                    port=node.value.port,
+                )
+                randint = random.randint(1, len(mysqls))
+                random_mysqls = random.sample(mysqls, randint)
+                logger.info("Put new MySQL nodes into etcd")
+                await cli.put(
+                    data=MySQLEtcdData(
+                        nodes=[
+                            Server(
+                                host=i.value.host,
+                                port=i.value.port,
+                                state=State.Run,
+                            )
+                            for i in random_mysqls
+                        ]
+                    )
+                )
+                break
+            except Exception as e:
+                logger.exception(e)
+                continue
+        else:
+            raise RuntimeError
+
+    async def _check_mysql():
+        """
+
+        Waiting for etcd to have more than 1 MySQL nodes.
+
+        """
+        logger.debug("Test MySQL servers on etcd")
+        _retry_count: int = 10
+        for _ in range(_retry_count):
+            try:
+                etcds = list(DockerEtcd)
+                for node in etcds:
+                    try:
+                        cli = MySQLEtcdClient(
+                            host=node.value.host,
+                            port=node.value.port,
+                        )
+                        data: MySQLEtcdData = await cli.get()
+                        if len(data.nodes) == 0:
+                            raise RuntimeError("No MySQL nodes")
+                        else:
+                            mysql_hosts.update(data.nodes)
+                            logger.info(
+                                f"MySQL servers. {[i.address_format() for i in data.nodes]}"
+                            )
+                        return
+                    except Exception as e:
+                        await asyncio.sleep(1)
+                        logger.error(e)
+                        continue
+                else:
+                    raise RuntimeError
+            except Exception as e:
+                logger.warning(e)
+                await asyncio.sleep(1)
+                continue
+        else:
+            raise RuntimeError
+
+    # Initial etcd node
+    await _do_update_etcd_data()
+    await _check_mysql()
+
+    async with run_proxy_server(
+        mysql_hosts=mysql_hosts,
+        unused_tcp_port=unused_tcp_port,
+    ):
+
+        async def _main():
+            for i in range(COUNT):
+                if i % 100 == 0:
+                    logger.info(f"Complete {int(100*i/COUNT)}%")
+                random_key = str(time.time_ns())
+                sleep_time = random.uniform(0, 0.3)
+                await asyncio.sleep(sleep_time)
+                last_e: Exception | None = None
+                for j in range(RETRY_COUNT):
+                    if j > 0:
+                        logger.warning(j)
+
+                    try:
+                        async with fix_proxy_connect(
+                            random_key,
+                            unused_tcp_port,
+                            timeout=10.0,
+                        ) as connect:
+                            cursor = await connect.cursor()
+                            async with cursor:
+                                await cursor.execute(
+                                    key=random_key,
+                                    query="SHOW VARIABLES LIKE 'time_zone'",
+                                )
+                        break
+                    except OperationalError as e:
+                        # Proxy server maybe graceful restart now
+                        logger.exception(e)
+                        last_e = e
+                        errcode = e.args[0]
+                        if errcode == 2003:
+                            await asyncio.sleep(RETRY_INTERVAL)
+                            continue
+
+                else:
+                    raise last_e
+
+        async def _update_etcd_data():
+            while True:
+                sleep_time = random.uniform(0, 0.5)
+                await asyncio.sleep(sleep_time)
+                await _do_update_etcd_data()
+
+        async def update_mysql_hosts(
+            mysql_hosts=mysql_hosts,
+        ):
+            while True:
+                await asyncio.sleep(1)
+                logger.info(f"Monitor hosts: {pformat(mysql_hosts.get_hosts())}")
+
+        _t1 = asyncio.create_task(_main())
+        _t2 = asyncio.create_task(_update_etcd_data())
+        _t3 = asyncio.create_task(
+            etcd_management(
+                mysql_hosts=mysql_hosts,
+                etcd_data=mmy_info.etcd,
+            )
+        )
+        _t4 = asyncio.create_task(
+            update_mysql_hosts(
+                mysql_hosts=mysql_hosts,
+            )
+        )
+        _, pending = await asyncio.wait(
+            [_t1, _t2, _t3, _t4],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for i in pending:
+            i.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await i

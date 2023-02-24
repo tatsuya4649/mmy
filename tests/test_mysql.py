@@ -7,15 +7,21 @@ import aiomysql
 import pytest
 import pytest_asyncio
 from aiomysql.cursors import DictCursor
-from mmy.mysql.client import (INSERT_ONCE_LIMIT, MySQLClient,
-                              MySQLClientTooManyInsertAtOnce, MySQLColumns,
-                              MySQLKeys, TableName, _Extra)
+from mmy.mysql.client import (
+    INSERT_ONCE_LIMIT,
+    MySQLClient,
+    MySQLClientTooManyInsertAtOnce,
+    MySQLColumns,
+    MySQLKeys,
+    TableName,
+    _Extra,
+)
 from pymysql.err import OperationalError
 from python_on_whales import docker
 from python_on_whales.exceptions import NoSuchContainer
 from rich import print
 
-from ._mysql import ROOT_USERINFO, TEST_TABLE1, TEST_TABLE2, _mmy_info
+from ._mysql import ROOT_USERINFO, TEST_TABLE2, _mmy_info
 from .docker import DockerStartupError, container
 
 
@@ -90,14 +96,6 @@ class TMySQLClient(MySQLClient):
                 await cursor.execute(f"CALL {call}({','.join(sargs)})")
 
             await connect.commit()
-
-    async def generate_random_user(self):
-        await self._generate_random(
-            TEST_TABLE1,
-            "generate_random_user",
-            self.GENERATE_RANDOM_DATA_REPEAT_COUNT,
-            self.GENERATE_RANDOM_DATA_MIN_COUNT,
-        )
 
     async def generate_random_post(self):
         await self._generate_random(
@@ -218,15 +216,7 @@ async def delete_all_table(
         db=mmy_info.mysql.db,
     ) as connect:
         cur = await connect.cursor()
-        await cur.execute("DELETE FROM %s" % (TEST_TABLE1))
-        await connect.commit()
-
-        cur = await connect.cursor()
         await cur.execute("DELETE FROM %s" % (TEST_TABLE2))
-        await connect.commit()
-
-        cur = await connect.cursor()
-        await cur.execute("OPTIMIZE TABLE %s" % (TEST_TABLE1))
         await connect.commit()
         cur = await connect.cursor()
         await cur.execute("OPTIMIZE TABLE %s" % (TEST_TABLE2))
@@ -249,11 +239,6 @@ async def random_generate_data(
     ) as connect:
         # Delete all table data from container
         await delete_all_table(container, mmy_info)
-        cur = await connect.cursor()
-        await cur.execute(
-            "CALL generate_random_user(%d, %d)" % (genereate_repeate, min_count)
-        )
-        await connect.commit()
 
         cur = await connect.cursor()
         await cur.execute(
@@ -267,7 +252,6 @@ async def random_generate_data(
 async def insert_random_data():
     cli = TMySQLClient()
     await cli.generate_random_post()
-    await cli.generate_random_user()
 
 
 @pytest.mark.asyncio
@@ -277,16 +261,16 @@ async def test_check_delete_with_consistent_hash():
 
     cli = TMySQLClient()
     await cli.consistent_hashing_delete(
-        table=TEST_TABLE1,
+        table=TEST_TABLE2,
         start=start,
         end=end,
     )
     await cli.optimize_table(
-        table=TEST_TABLE1,
+        table=TEST_TABLE2,
     )
 
     rows = await cli.get_table_rows(
-        table=TEST_TABLE1,
+        table=TEST_TABLE2,
     )
     """
 
@@ -300,7 +284,7 @@ async def test_check_delete_with_consistent_hash():
 async def test_primary_keys():
     cli = TMySQLClient()
     keys: list[MySQLKeys] = await cli.primary_keys_info(
-        table=TEST_TABLE1,
+        table=TEST_TABLE2,
     )
     assert len(keys) == 1
     for key in keys:
@@ -359,9 +343,9 @@ async def test_insert():
         )
 
     cli = TMySQLClient()
-    before_rows = await cli.get_table_rows(TEST_TABLE1)
-    await cli.insert(TEST_TABLE1, datas)
-    after_rows = await cli.get_table_rows(TEST_TABLE1)
+    before_rows = await cli.get_table_rows(TEST_TABLE2)
+    await cli.insert(TEST_TABLE2, datas)
+    after_rows = await cli.get_table_rows(TEST_TABLE2)
     assert before_rows + len(datas) == after_rows
     return
 
@@ -384,13 +368,13 @@ async def test_insert_too_many():
 
     cli = TMySQLClient()
     with pytest.raises(MySQLClientTooManyInsertAtOnce):
-        await cli.insert(TEST_TABLE1, datas)
+        await cli.insert(TEST_TABLE2, datas)
 
 
 @pytest.mark.asyncio
 async def test_columns_info():
     cli = TMySQLClient()
-    columns: list[MySQLColumns] = await cli.columns_info(TEST_TABLE1)
+    columns: list[MySQLColumns] = await cli.columns_info(TEST_TABLE2)
     assert isinstance(columns, list)
     for column in columns:
         assert isinstance(column, MySQLColumns)
@@ -399,7 +383,7 @@ async def test_columns_info():
 @pytest.mark.asyncio
 async def test_exclude_auto_increment():
     cli = TMySQLClient()
-    columns: list[MySQLColumns] = await cli.columns_info(TEST_TABLE1)
+    columns: list[MySQLColumns] = await cli.columns_info(TEST_TABLE2)
     _excluded: list[MySQLColumns] = cli.exclude_auto_increment_columns(columns)
     assert isinstance(columns, list)
     assert isinstance(_excluded, list)

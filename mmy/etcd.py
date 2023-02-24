@@ -7,6 +7,7 @@ import ipaddress
 import json
 import time
 from dataclasses import asdict, dataclass
+from pprint import pformat
 from typing import Any, AsyncGenerator, TypeAlias
 
 import httpx
@@ -171,13 +172,12 @@ class EtcdClient(abc.ABC, Generic[_EtcdData]):
                     logger.info("Receive event from %s" % (self._address))
                     jchunk = json.loads(chunk)
                     if jchunk.get("error") is not None:
-                        logger.error("Occurred error: %s" % (jchunk))
-                        break
+                        raise EtcdError("Occurred error: %s" % (pformat(jchunk)))
 
                     result = jchunk["result"]
                     events = result.get("events", [])
                     for event in events:
-                        logger.info(event)
+                        logger.info(pformat(event))
                         kv = event.get("kv")
                         try:
                             yield self._parse_kv(kv)
