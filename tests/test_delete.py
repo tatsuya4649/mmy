@@ -1,7 +1,9 @@
 import hashlib
 import logging
 import random
+import time
 from copy import copy
+from datetime import datetime, timezone
 from typing import Any
 
 import aiomysql
@@ -31,8 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 class TestDelete:
-    GENERAETE_REPEAT: int = 7
+    GENERAETE_REPEAT: int = 24
     MIN_COUNT: int = 100000
+    LOG_STEP: int = 1000
     sleep_secs_before_datamove_again: float = 0.1
 
     @pytest.mark.asyncio
@@ -84,9 +87,7 @@ class TestDelete:
         """
         mysql_containers = get_mysql_docker_for_test()
         await etcd_put_mysql_container(mysql_containers)
-        user_data: list[dict[str, Any]] = list()
         post_data: list[dict[str, Any]] = list()
-        delete_before_user_count: int = 0
         delete_before_post_count: int = 0
         for container in mysql_containers:
             await up_mysql_docker_container(container)
@@ -166,7 +167,6 @@ class TestDelete:
                 post_data.extend(await cur.fetchall())
 
         delete_before_post_count = len(post_data)
-        delete_before_user_count = len(user_data)
 
         cons = copy(mysql_containers)
         cons.pop(0)
@@ -219,7 +219,7 @@ class TestDelete:
         # Check same data on multiple MySQL nodes
         logger.info("Inconsistency test with post datas")
         for data_index, item in enumerate(post_data):
-            if data_index % 100 == 0:
+            if data_index % self.LOG_STEP == 0:
                 logger.info(f"Done: {data_index/len(post_data)}")
 
             i = 0
@@ -257,7 +257,6 @@ class TestDelete:
         and check for correctiong hashed data and placed node.
 
         """
-        user_data: list[dict[str, Any]] = list()
         post_data: list[dict[str, Any]] = list()
 
         mysql_containers = get_mysql_docker_for_test()
@@ -316,7 +315,7 @@ class TestDelete:
 
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
             for data_index, post in enumerate(post_data):
-                if data_index % 100 == 0:
+                if data_index % self.LOG_STEP == 0:
                     logger.info(f"Done: {data_index/len(post_data)}")
 
                 key = post["id"]  # not AUTO_INCREMENT
@@ -324,39 +323,31 @@ class TestDelete:
                 instance = nodeinfo["instance"]
 
                 for con in cons[index + 1 :]:
-                    try:
-                        async with aiomysql.connect(
-                            host=str(con.value.host),
-                            port=con.value.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            await cur.execute(
-                                f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
-                                {
-                                    "_id": key,
-                                },
-                            )
-                            _f = await cur.fetchone()
-                            assert _f["count"] == 1
+                    async with aiomysql.connect(
+                        host=str(con.value.host),
+                        port=con.value.port,
+                        user=ROOT_USERINFO.user,
+                        cursorclass=DictCursor,
+                        password=ROOT_USERINFO.password,
+                        db=mmy_info.mysql.db,
+                    ) as connect:
+                        cur = await connect.cursor()
+                        await cur.execute(
+                            f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                            {
+                                "_id": key,
+                            },
+                        )
+                        _f = await cur.fetchone()
+                        _count = _f["count"]
 
-                            if not (
-                                con.value.host == instance.host
-                                and con.value.port == instance.port
-                            ):
-                                raise RuntimeError(
-                                    f"Data({key}) must be in {instance.address_format()} but, in {con.value.address_format}"
-                                )
-                            else:
-                                break  # Pass
-                    except AssertionError:
-                        continue
-
-                else:
-                    raise RuntimeError(f'Not found data: "{key}"')
+                        if (
+                            con.value.host == instance.host
+                            and con.value.port == instance.port
+                        ):
+                            assert _count == 1
+                        else:
+                            assert _count == 0
 
     @pytest_asyncio.fixture
     async def before_deleted_nodes(
@@ -471,7 +462,6 @@ class TestDelete:
         )
         for index, container in enumerate(delete_cons):
             mocker.stopall()
-            before_delete_user_count: int = 0
             before_delete_post_count: int = 0
 
             async def actually_move_data(*args, **kwargs):
@@ -486,11 +476,16 @@ class TestDelete:
                 logger.info("it emulates inserting data while moving data to new node")
 
                 for i in range(COUNT):
-                    if i % 100 == 0:
-                        logger.info(f"INSERT {int(100*(i/COUNT))}%")
+                    if i % self.LOG_STEP == 0:
+                        logger.info(f"INSERT {i}/{COUNT}")
 
                     while True:
-                        _id = random.randint(1000000000, 2000000000)
+                        _id = str(time.time_ns())
+                        _title = hashlib.sha256(_id.encode("utf-8")).hexdigest()
+                        _md5 = hashlib.md5(_id.encode("utf-8")).hexdigest()
+                        _duration = random.uniform(0, 10)
+                        _do_on = datetime.now(timezone.utc)
+
                         _node = _prev_ring.get(data=_id)
                         _instance: Server = _node["instance"]
                         if (
@@ -499,9 +494,6 @@ class TestDelete:
                         ):
                             continue
 
-                        _bid = _id.to_bytes(4, "little")
-                        _name = hashlib.sha256(_bid).hexdigest()
-                        _md5 = hashlib.md5(_bid).hexdigest()
                         # mysql random generate
                         async with aiomysql.connect(
                             host=str(_instance.host),
@@ -514,8 +506,20 @@ class TestDelete:
                             cur = await connect.cursor()
                             async with cur:
                                 await cur.execute(
-                                    f"INSERT INTO {TEST_TABLE2}(id, title, md5) VALUES (%s, %s, %s)",
-                                    ((_id, _name, _md5)),
+                                    query=f"INSERT INTO {TEST_TABLE2}(\
+                                        id, \
+                                        md5, \
+                                        title, \
+                                        duration, \
+                                        do_on \
+                                        ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
+                                    args={
+                                        "id": _id,
+                                        "md5": _md5,
+                                        "title": _title,
+                                        "duration": _duration,
+                                        "do_on": _do_on,
+                                    },
                                 )
                             await connect.commit()
 
@@ -558,7 +562,6 @@ class TestDelete:
                 server=_server,
             )
 
-            user_data: list[dict[str, Any]] = list()
             post_data: list[dict[str, Any]] = list()
             for _mysql in cons:
                 async with aiomysql.connect(
@@ -591,28 +594,28 @@ class TestDelete:
                 res = await cur.fetchone()
                 assert res["count"] == 0
 
-            assert before_delete_user_count + COUNT == len(user_data)
             assert before_delete_post_count + COUNT == len(post_data)
 
             ring = deleter.ring
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
-            for data_index, post in enumerate(post_data):
-                if data_index % 100 == 0:
-                    logger.info(f"Done: {data_index/len(post_data)}")
 
-                key = post["id"]  # not AUTO_INCREMENT
-                nodeinfo = ring.get(key)
-                instance = nodeinfo["instance"]
+            for con in cons:
+                async with aiomysql.connect(
+                    host=str(con.value.host),
+                    port=con.value.port,
+                    user=ROOT_USERINFO.user,
+                    cursorclass=DictCursor,
+                    password=ROOT_USERINFO.password,
+                    db=mmy_info.mysql.db,
+                ) as connect:
+                    for data_index, post in enumerate(post_data):
+                        if data_index % self.LOG_STEP == 0:
+                            logger.info(f"Done: {data_index}/{len(post_data)}")
 
-                for con in cons:
-                    async with aiomysql.connect(
-                        host=str(con.value.host),
-                        port=con.value.port,
-                        user=ROOT_USERINFO.user,
-                        cursorclass=DictCursor,
-                        password=ROOT_USERINFO.password,
-                        db=mmy_info.mysql.db,
-                    ) as connect:
+                        key = post["id"]  # not AUTO_INCREMENT
+                        nodeinfo = ring.get(key)
+                        instance = nodeinfo["instance"]
+
                         cur = await connect.cursor()
                         await cur.execute(
                             f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
@@ -621,10 +624,18 @@ class TestDelete:
                             },
                         )
                         _f = await cur.fetchone()
-                        if not (
-                            con.value.host == instance.host
-                            and con.value.port == instance.port
-                        ):
-                            assert len(res) == 1
-                        else:
-                            assert len(res) == 0
+                        _count = _f["count"]
+                        try:
+                            if (
+                                con.value.host == instance.host
+                                and con.value.port == instance.port
+                            ):
+                                assert _count == 1
+                            else:
+                                assert _count == 0
+                        except AssertionError as e:
+                            logger.info("#################")
+                            logger.info(key)
+                            logger.info(con.name)
+                            logger.info(instance)
+                            raise e

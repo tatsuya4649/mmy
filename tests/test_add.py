@@ -2,6 +2,7 @@ import hashlib
 import logging
 import random
 import time
+from datetime import datetime, timezone
 from typing import Any, Coroutine
 
 import aiomysql
@@ -32,10 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 class TestAdd:
-    GENERAETE_REPEAT: int = 9
+    GENERAETE_REPEAT: int = 24
     MIN_COUNT: int = 10000
     sleep_secs_before_datamove_again: float = 0.1
     SLEEP_SECS_AFTER_ETCD_ADD_NEW_NODE: float = 0.1
+    LOG_STEP: int = 1000
 
     async def generate_random_data(
         self,
@@ -78,10 +80,9 @@ class TestAdd:
         mmy_info: MmyYAML,
     ):
         for container in get_mysql_docker_for_test():
-            _c = container.value
             _server = _Server(
-                host=_c.host,
-                port=_c.port,
+                host=container.value.host,
+                port=container.value.port,
             )
             # Start MySQL container
             await up_mysql_docker_container(container)
@@ -189,7 +190,7 @@ class TestAdd:
         # Check same data on multiple MySQL nodes
         logger.info("Inconsistency test with post datas")
         for index, item in enumerate(post_data):
-            if index % 100 == 0:
+            if index % self.LOG_STEP == 0:
                 logger.info(f"Testing post data... {index}/{len(user_data)}")
 
             i = 0
@@ -278,7 +279,7 @@ class TestAdd:
             )
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
             for data_index, post in enumerate(init_post_data):
-                if data_index % 100 == 0:
+                if data_index % self.LOG_STEP == 0:
                     logger.info(f"Done: {data_index/len(init_post_data)}")
 
                 key = post["id"]  # not AUTO_INCREMENT
@@ -286,39 +287,31 @@ class TestAdd:
                 instance = nodeinfo["instance"]
 
                 for con in all_cluster_mysqls:
-                    try:
-                        async with aiomysql.connect(
-                            host=str(con.value.host),
-                            port=con.value.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            await cur.execute(
-                                f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
-                                {
-                                    "_id": key,
-                                },
-                            )
-                            _f = await cur.fetchone()
-                            assert _f["count"] == 1
+                    async with aiomysql.connect(
+                        host=str(con.value.host),
+                        port=con.value.port,
+                        user=ROOT_USERINFO.user,
+                        cursorclass=DictCursor,
+                        password=ROOT_USERINFO.password,
+                        db=mmy_info.mysql.db,
+                    ) as connect:
+                        cur = await connect.cursor()
+                        await cur.execute(
+                            f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                            {
+                                "_id": key,
+                            },
+                        )
+                        _f = await cur.fetchone()
+                        _count = _f["count"]
 
-                            if not (
-                                con.value.host == instance.host
-                                and con.value.port == instance.port
-                            ):
-                                raise RuntimeError(
-                                    f"Data({key}) must be in {instance.address_format()} but, in {con.value.address_format}"
-                                )
-                            else:
-                                break  # Pass
-                    except AssertionError:
-                        continue
-
-                else:
-                    raise RuntimeError(f'Not found data: "{key}"')
+                        if (
+                            con.value.host == instance.host
+                            and con.value.port == instance.port
+                        ):
+                            assert _count == 1
+                        else:
+                            assert _count == 0
 
     @pytest_asyncio.fixture
     async def init_add_mysql1(self, mmy_info):
@@ -646,12 +639,14 @@ class TestAdd:
                 )
                 logger.info("it emulates inserting data while moving data to new node")
                 for i in range(COUNT):
-                    if i % 100 == 0:
-                        logger.info(f"INSERT {int(100*(i/COUNT))}%")
-                    _id = random.randint(1000000000, 2000000000)
-                    _bid = _id.to_bytes(4, "little")
-                    _name = hashlib.sha256(_bid).hexdigest()
-                    _md5 = hashlib.md5(_bid).hexdigest()
+                    if i % self.LOG_STEP == 0:
+                        logger.info(f"INSERT {i}/{COUNT}")
+
+                    _id = str(time.time_ns())
+                    _title = hashlib.sha256(_id.encode("utf-8")).hexdigest()
+                    _md5 = hashlib.md5(_id.encode("utf-8")).hexdigest()
+                    _duration = random.uniform(0, 10)
+                    _do_on = datetime.now(timezone.utc)
 
                     _node = _ring.get_without_move(data=_id)
                     _instance = _node["instance"]
@@ -667,8 +662,20 @@ class TestAdd:
                         cur = await connect.cursor()
                         async with cur:
                             await cur.execute(
-                                f"INSERT INTO {TEST_TABLE2}(id, title, md5) VALUES (%s, %s, %s)",
-                                ((_id, _name, _md5)),
+                                query=f"INSERT INTO {TEST_TABLE2}(\
+                                    id, \
+                                    md5, \
+                                    title, \
+                                    duration, \
+                                    do_on \
+                                    ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
+                                args={
+                                    "id": _id,
+                                    "md5": _md5,
+                                    "title": _title,
+                                    "duration": _duration,
+                                    "do_on": _do_on,
+                                },
                             )
                         await connect.commit()
 
@@ -685,7 +692,6 @@ class TestAdd:
             )
 
             all_cluster_mysqls = cons[: index + 1]
-            before_add_user_count: int = 0
             before_add_post_count: int = 0
             for _mysql in all_cluster_mysqls:
                 async with aiomysql.connect(
@@ -710,7 +716,6 @@ class TestAdd:
                 server=_server,
             )
 
-            user_data: list[dict[str, Any]] = list()
             post_data: list[dict[str, Any]] = list()
             for _mysql in all_cluster_mysqls:
                 async with aiomysql.connect(
@@ -727,7 +732,6 @@ class TestAdd:
                     await cur.execute("SELECT * FROM %s" % (TEST_TABLE2))
                     post_data.extend(await cur.fetchall())
 
-            assert before_add_user_count + COUNT == len(user_data)
             assert before_add_post_count + COUNT == len(post_data)
 
             ring = MySQLRing(
@@ -743,42 +747,36 @@ class TestAdd:
             )
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
             for data_index, post in enumerate(post_data):
-                if data_index % 100 == 0:
-                    logger.info(f"Done: {int(100*(data_index/len(post_data)))}")
+                if data_index % self.LOG_STEP == 0:
+                    logger.info(f"Done: {data_index}/{len(post_data)}")
 
                 key = post["id"]  # not AUTO_INCREMENT
                 nodeinfo = ring.get(key)
                 instance = nodeinfo["instance"]
 
                 for con in all_cluster_mysqls:
-                    try:
-                        async with aiomysql.connect(
-                            host=str(con.value.host),
-                            port=con.value.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            await cur.execute(
-                                f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
-                                {
-                                    "_id": key,
-                                },
-                            )
-                            _f = await cur.fetchone()
-                            assert _f["count"] == 1
+                    async with aiomysql.connect(
+                        host=str(con.value.host),
+                        port=con.value.port,
+                        user=ROOT_USERINFO.user,
+                        cursorclass=DictCursor,
+                        password=ROOT_USERINFO.password,
+                        db=mmy_info.mysql.db,
+                    ) as connect:
+                        cur = await connect.cursor()
+                        await cur.execute(
+                            f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                            {
+                                "_id": key,
+                            },
+                        )
+                        _f = await cur.fetchone()
+                        _count = _f["count"]
 
-                            if not (
-                                con.value.host == instance.host
-                                and con.value.port == instance.port
-                            ):
-                                raise RuntimeError(
-                                    f"Data({key}) must be in {instance.address_format()} but, in {con.value.address_format}"
-                                )
-                    except AssertionError:
-                        continue
-
-                else:
-                    raise RuntimeError(f'Not found data: "{key}"')
+                        if (
+                            con.value.host == instance.host
+                            and con.value.port == instance.port
+                        ):
+                            assert _count == 1
+                        else:
+                            assert _count == 0

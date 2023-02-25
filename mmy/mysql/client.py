@@ -358,7 +358,7 @@ class MySQLClient:
             cursor = await connect.cursor()
             async with cursor:
                 columns: str = ", ".join(first_item.keys())
-                values: str = ", ".join(list(map(lambda x: "%s", first_item.keys())))
+                values: str = ", ".join(list(map(lambda _: "%s", first_item.keys())))
                 if insert_ignore:
                     update_columns: str = ", ".join(
                         list(map(lambda x: f"{x}=_f.{x}", first_item.keys()))
@@ -485,15 +485,6 @@ class MySQLClient:
         async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
-                self.logger.info(
-                    cursor.mogrify(
-                        f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
-                        {
-                            "start": start.point,
-                            "end": end.point,
-                        },
-                    )
-                )
                 await cursor.execute(
                     f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
                     {

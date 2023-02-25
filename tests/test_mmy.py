@@ -259,40 +259,31 @@ class TestIntegration:
                 instance = nodeinfo["instance"]
 
                 for con in current_nodes:
-                    try:
-                        async with aiomysql.connect(
-                            host=str(con.value.host),
-                            port=con.value.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            await cur.execute(
-                                f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
-                                {
-                                    "_id": key,
-                                },
-                            )
-                            _f = await cur.fetchone()
-                            assert _f["count"] == 1
+                    async with aiomysql.connect(
+                        host=str(con.value.host),
+                        port=con.value.port,
+                        user=ROOT_USERINFO.user,
+                        cursorclass=DictCursor,
+                        password=ROOT_USERINFO.password,
+                        db=mmy_info.mysql.db,
+                    ) as connect:
+                        cur = await connect.cursor()
+                        await cur.execute(
+                            f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                            {
+                                "_id": key,
+                            },
+                        )
+                        _f = await cur.fetchone()
+                        _count = _f["count"]
 
-                            if not (
-                                con.value.host == instance.host
-                                and con.value.port == instance.port
-                            ):
-                                logger.info(pformat(ring._hr.get_points()))
-                                raise RuntimeError(
-                                    f"Data({key}) must be in {instance.address_format()} but, in {con.value.address_format}"
-                                )
-                            else:
-                                break  # Pass
-                    except AssertionError:
-                        continue
-
-                else:
-                    raise RuntimeError(f'Not found data: "{key}"')
+                        if (
+                            con.value.host == instance.host
+                            and con.value.port == instance.port
+                        ):
+                            assert _count == 1
+                        else:
+                            assert _count == 0
 
     async def _setup_for_test_proxy(self, mmy_info):
         # Setup

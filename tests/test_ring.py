@@ -5,7 +5,6 @@ from hashlib import md5
 import pytest
 from mmy.ring import MDP, Md, MySQLRing
 from mmy.server import Server, State
-from tqdm import tqdm
 
 from ._mysql import mmy_info
 
@@ -13,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 class TestMySQLRing:
+    LOG_STEP: int = 1000
+
     def generate_random_ip(self):
         fn = lambda: random.randint(0, 255)
         return f"{fn()}.{fn()}.{fn()}.{fn()}"
@@ -47,7 +48,7 @@ class TestMySQLRing:
         )
 
         assert len(ring) == INIT_COUNT
-        for index, new_node in enumerate(tqdm(self.sample_nodes(count=NEW_COUNT))):
+        for index, new_node in enumerate(self.sample_nodes(count=NEW_COUNT)):
 
             async def _move(mdp: MDP):
                 """
@@ -89,7 +90,7 @@ class TestMySQLRing:
         )
         assert len(ring) == INIT_COUNT
 
-        for index, deleted_node in enumerate(tqdm(init_nodes)):
+        for index, deleted_node in enumerate(init_nodes):
 
             async def _move(mdp: MDP):
                 """
@@ -171,3 +172,25 @@ class TestMySQLRing:
         _ps: list[Md] = ring.not_owner_points(first_node)
         for p in _ps:
             assert p.node != first_node
+
+    def sample_md5_gen(self) -> list[str]:
+        from hashlib import md5
+
+        _sample_md5 = md5(b"a").hexdigest()
+        _sample_md5_length = len(_sample_md5)
+
+        a = "0" * _sample_md5_length
+        i = int(a, 16)
+        BYTES = 3
+        COUNT = 256**BYTES
+        _padding_length = _sample_md5_length - BYTES * 2
+        res = list()
+        for i in range(0, COUNT):
+            i += 1
+            b = "{i:0{width}x}".format(i=i, width=2 * BYTES)
+            b += "0" * _padding_length
+
+            res.append(b)
+
+        res.sort()
+        return res

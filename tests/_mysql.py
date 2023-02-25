@@ -42,5 +42,5 @@ async def delete_all_table(
         await connect.commit()
 
         cur = await connect.cursor()
-        await cur.execute("ALTER TABLE `%s`  AUTO_INCREMENT = 1" % (TEST_TABLE2))
+        await cur.execute("ALTER TABLE `%s`  AUTO_INCREMENT = 0" % (TEST_TABLE2))
         await connect.commit()

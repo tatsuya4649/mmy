@@ -1,24 +1,20 @@
 import asyncio
 import logging
+import time
 from typing import Coroutine
 
-from mmy.etcd import (
-    EtcdConnectError,
-    MmyEtcdInfo,
-    MySQLEtcdClient,
-    MySQLEtcdData,
-    MySQLEtcdDuplicateNode,
-)
+from mmy.etcd import EtcdConnectError, MmyEtcdInfo, MySQLEtcdClient, MySQLEtcdData
 from mmy.mysql.client import (
     MmyMySQLInfo,
     MySQLClient,
     MySQLInsertDuplicateBehavior,
     TableName,
 )
-from mmy.ring import MovedData, MovedTableData, MySQLRing, RingNoMoveYet
-from mmy.server import Server, State, _Server, address_from_server, state_rich_str
+from mmy.ring import MovedData, MySQLRing, RingNoMoveYet
+from mmy.server import Server, State, _Server
 from rich import print
 
+from ..const import BENCHMARK_ROUND_DECIMAL_PLACES
 from .add import PingType
 
 logger = logging.getLogger(__name__)
@@ -67,6 +63,23 @@ class MySQLDeleterNotExistError(ValueError):
     pass
 
 
+def delete_elapsed_time(cor):
+    async def _wrap_rollback(*args, **kwargs):
+        self: MySQLDeleter = args[0]
+        assert isinstance(self, MySQLDeleter) is True
+        _s = time.perf_counter()
+        res = await cor(*args, **kwargs)
+        _e = time.perf_counter()
+
+        _time: float = round(_e - _s, BENCHMARK_ROUND_DECIMAL_PLACES)
+        logger.info(
+            f"It took {_time}s to delete MySQL node({self.server.address_format()})"
+        )
+        return res
+
+    return _wrap_rollback
+
+
 class MySQLDeleter(Stepper):
     def __init__(
         self,
@@ -79,7 +92,7 @@ class MySQLDeleter(Stepper):
         self._ring: MySQLRing = MySQLRing(
             mysql_info=self._mysql_info,
             init_nodes=[],
-            insert_duplicate_behavior=MySQLInsertDuplicateBehavior.DeleteAutoIncrement,
+            insert_duplicate_behavior=MySQLInsertDuplicateBehavior.Raise,
         )
         self._prev_ring: MySQLRing = MySQLRing(
             mysql_info=self._mysql_info,
@@ -184,6 +197,134 @@ class MySQLDeleter(Stepper):
 
         return
 
+    async def _get_mysql_from_etcd(self) -> MySQLEtcdData:
+        etcd_cli = MySQLEtcdClient(
+            host=self.etcd.host,
+            port=self.etcd.port,
+        )
+        self.update_step(DeleterStep.FetchNodesInfo)
+        now_data: MySQLEtcdData = await etcd_cli.get()
+        return now_data
+
+    async def _update_deleted_node_state(self):
+        logger.info("Update state of deleted MySQL node on etcd")
+        etcd_cli = MySQLEtcdClient(
+            host=self.etcd.host,
+            port=self.etcd.port,
+        )
+        await etcd_cli.update_state(
+            server=self.server,
+            state=State.Move,
+        )
+
+    async def _delete_node_state(self):
+        logger.info("Update state of deleted MySQL node on etcd")
+        etcd_cli = MySQLEtcdClient(
+            host=self.etcd.host,
+            port=self.etcd.port,
+        )
+        await etcd_cli.delete_node(
+            server=self.server,
+        )
+
+    async def _delete_unnecessary_data(self):
+        logger.info(
+            "Delete unnecessary data(non owner of hashed) from deleted MySQL node"
+        )
+        node = Server(
+            host=self.server.host,
+            port=self.server.port,
+            state=State.Run,
+        )
+        try:
+            await self._ring.delete_data_from_deleted_node(
+                node=node,
+            )
+            logger.info("Optimize MySQL nodes with data moved")
+            await self._ring.optimize_table_deleted_node(
+                node=node,
+            )
+        except RingNoMoveYet:
+            logger.info("No moved data")
+
+    @delete_elapsed_time
+    async def _do(
+        self,
+        ping_type: PingType = PingType.AllServer,
+        delete_data: bool = True,
+        sleep_secs_before_datamove_again: int | float = 60,
+        not_update_while_moving: bool = False,
+    ):
+        self.update_step(DeleterStep.Init)
+        now_data = await self._get_mysql_from_etcd()
+
+        self.update_step(DeleterStep.CheckServerIsValid)
+        await self.must_exist_deleted_node_etcd_nodes(now_data)
+
+        self._prev_ring = MySQLRing(
+            mysql_info=self._mysql_info,
+            init_nodes=now_data.nodes,
+        )
+        self._ring = MySQLRing(
+            mysql_info=self._mysql_info,
+            init_nodes=now_data.nodes,
+            insert_duplicate_behavior=MySQLInsertDuplicateBehavior.Raise,
+        )
+        node = Server(
+            host=self.server.host,
+            port=self.server.port,
+            state=State.Run,
+        )
+        prev_nodes_length: int = len(self._ring)
+        self.update_step(DeleterStep.HashRingCalculate)
+        moves: list[Coroutine[None, None, MovedData | None]] = await self._ring.delete(
+            node=node,
+        )
+        new_nodes_length: int = len(self._ring)
+        if new_nodes_length == 0:
+            raise MySQLDeleterNoServer("If delete this server, there won't be one left")
+
+        logger.info(f"Nodes count: {prev_nodes_length} => {new_nodes_length}")
+        assert new_nodes_length == prev_nodes_length - 1
+
+        self.update_step(DeleterStep.Ping)
+        await self.ping(
+            ping_type=ping_type,
+            etcd_data=now_data,
+        )
+
+        self.update_step(DeleterStep.DataMove)
+        await self._log_table_size()
+        await self.fetch_rows_by_tables()
+        # Actually moving data
+        moved_datas: list[MovedData] = await self.actually_move_data(moves)
+
+        # The reason why not updating state to Move before moving data,
+        # If set "Move" state, rejecting the data from the mmy proxy.
+        # So, Do moving data, and update state, and moving data again.
+        self.update_step(DeleterStep.UpdateDeletedNodeState)
+        await self._update_deleted_node_state()
+        self.update_step(DeleterStep.TestMovedData)
+        await self.test_moved_data(
+            moved_datas,
+            not_update_while_moving=not_update_while_moving,
+        )
+
+        # Wait for node information to propagate in all etcd nodes
+        self.update_step(DeleterStep.DataMoveAgain)
+        await asyncio.sleep(sleep_secs_before_datamove_again)
+
+        await self.move_data_again()
+
+        if delete_data:
+            self.update_step(DeleterStep.DeleteDataFromDeletedNode)
+            await self._delete_unnecessary_data()
+
+        self.update_step(DeleterStep.DeleteNode)
+        await self._delete_node_state()
+        self.update_step(DeleterStep.Done)
+        return
+
     async def do(
         self,
         server: _Server,
@@ -198,115 +339,16 @@ class MySQLDeleter(Stepper):
 
         """
         self.server = server
-        try:
-            for etcd in self._etcd_info.nodes:
-                self.update_step(DeleterStep.Init)
-                try:
-                    etcd_cli = MySQLEtcdClient(
-                        host=etcd.host,
-                        port=etcd.port,
-                    )
-                    self.update_step(DeleterStep.FetchNodesInfo)
-                    now_data: MySQLEtcdData = await etcd_cli.get()
-                except EtcdConnectError:
-                    continue
-
-                self.update_step(DeleterStep.CheckServerIsValid)
-                await self.must_exist_deleted_node_etcd_nodes(now_data)
-
-                self._prev_ring = MySQLRing(
-                    mysql_info=self._mysql_info,
-                    init_nodes=now_data.nodes,
-                )
-                self._ring = MySQLRing(
-                    mysql_info=self._mysql_info,
-                    init_nodes=now_data.nodes,
-                    insert_duplicate_behavior=MySQLInsertDuplicateBehavior.DeleteAutoIncrement,
-                )
-                node = Server(
-                    host=server.host,
-                    port=server.port,
-                    state=State.Run,
-                )
-                prev_nodes_length: int = len(self._ring)
-                self.update_step(DeleterStep.HashRingCalculate)
-                moves: list[
-                    Coroutine[None, None, MovedData | None]
-                ] = await self._ring.delete(
-                    node=node,
-                )
-                new_nodes_length: int = len(self._ring)
-                if new_nodes_length == 0:
-                    raise MySQLDeleterNoServer(
-                        "If delete this server, there won't be one left"
-                    )
-                logger.info(f"Nodes count: {prev_nodes_length} => {new_nodes_length}")
-                assert new_nodes_length == prev_nodes_length - 1
-
-                self.update_step(DeleterStep.Ping)
-                await self.ping(
-                    ping_type=ping_type,
-                    etcd_data=now_data,
-                )
-
-                try:
-                    self.update_step(DeleterStep.DataMove)
-                    await self._log_table_size()
-                    await self.fetch_rows_by_tables()
-                    # Actually moving data
-                    moved_datas: list[MovedData] = await self.actually_move_data(moves)
-
-                    # The reason why not updating state to Move before moving data,
-                    # If set "Move" state, rejecting the data from the mmy proxy.
-                    # So, Do moving data, and update state, and moving data again.
-                    self.update_step(DeleterStep.UpdateDeletedNodeState)
-                    logger.info("Update state of deleted MySQL node on etcd")
-                    await etcd_cli.update_state(
-                        server=server,
-                        state=State.Move,
-                    )
-                    logger.info("New MySQL state: %s" % (State.Run.value))
-                    self.update_step(DeleterStep.TestMovedData)
-                    await self.test_moved_data(
-                        moved_datas,
-                        not_update_while_moving=not_update_while_moving,
-                    )
-
-                    # Wait for node information to propagate in all etcd nodes
-                    self.update_step(DeleterStep.DataMoveAgain)
-                    await asyncio.sleep(sleep_secs_before_datamove_again)
-
-                    await self.move_data_again()
-
-                    if delete_data:
-                        self.update_step(DeleterStep.DeleteDataFromDeletedNode)
-                        logger.info(
-                            "Delete unnecessary data(non owner of hashed) from deleted MySQL node"
-                        )
-                        try:
-                            await self._ring.delete_data_from_deleted_node(
-                                node=node,
-                            )
-                            logger.info("Optimize MySQL nodes with data moved")
-                            await self._ring.optimize_table_deleted_node(
-                                node=node,
-                            )
-                        except RingNoMoveYet:
-                            logger.info("No moved data")
-
-                    self.update_step(DeleterStep.DeleteNode)
-                    await etcd_cli.delete_node(
-                        server=server,
-                    )
-                    self.update_step(DeleterStep.Done)
-                    logger.info("Done !")
-                    return
-                except EtcdConnectError:
-                    continue
-            else:
-                raise EtcdConnectError("No alive etcd nodes")
-        except MySQLEtcdDuplicateNode:
-            logger.error("This IP address already exists on etcd")
+        for etcd in self._etcd_info.nodes:
+            self.etcd = etcd
+            return await self._do(
+                ping_type=ping_type,
+                delete_data=delete_data,
+                sleep_secs_before_datamove_again=sleep_secs_before_datamove_again,
+                not_update_while_moving=not_update_while_moving,
+            )
+        else:
+            raise EtcdConnectError("No alive etcd nodes")
 
     async def test_moved_data(
         self,
@@ -318,7 +360,7 @@ class MySQLDeleter(Stepper):
         for data in datas:
             for _table in data.tables:
                 logger.info(
-                    f"{_table}: {data._from.start_point[:4]}~{data._from.end_point[:4]}: {_table.moved_count}"
+                    f"{_table.tablename}: {data._from.start_point[:4]}~{data._from.end_point[:4]}: {_table.moved_count}"
                 )
                 _d.setdefault(_table.tablename, 0)
                 _d[_table.tablename] += _table.moved_count

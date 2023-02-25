@@ -180,6 +180,10 @@ class Ring(RingMeta, RingHandler):
     def nodename_from_node(cls, node: Server) -> str:
         return f"%s:%d" % (str(node.host), node.port)
 
+    @property
+    def vnodes(self) -> int:
+        return self._default_vnodes
+
     def ring_node_count(self) -> int:
         return self._hr.size
 

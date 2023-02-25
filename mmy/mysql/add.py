@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
+import time
 from enum import Enum, auto
+from pprint import pformat
 from typing import Coroutine
 
 from mmy.etcd import (
@@ -22,6 +23,7 @@ from mmy.ring import MovedData, MySQLRing, RingNoMoveYet
 from mmy.server import Server, State, _Server, address_from_server
 from rich import print
 
+from ..const import BENCHMARK_ROUND_DECIMAL_PLACES
 from .step import Step, Stepper, StepType
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,19 @@ def multiple_retry(cor):
     return _wrap_rollback
 
 
+def add_elapsed_time(cor):
+    async def _wrap_rollback(*args, **kwargs):
+        _s = time.perf_counter()
+        res = await cor(*args, **kwargs)
+        _e = time.perf_counter()
+
+        _time: float = round(_e - _s, BENCHMARK_ROUND_DECIMAL_PLACES)
+        logger.info(f"It took {_time}s to add new MySQL node")
+        return res
+
+    return _wrap_rollback
+
+
 PING_RETRY_COUNT = 3
 PING_RETRY_INTERVAL_SECS: int = 10
 
@@ -117,7 +132,7 @@ class MySQLAdder(Stepper):
         self._ring: MySQLRing = MySQLRing(
             mysql_info=self._mysql_info,
             init_nodes=[],
-            insert_duplicate_behavior=MySQLInsertDuplicateBehavior.DeleteAutoIncrement,
+            insert_duplicate_behavior=MySQLInsertDuplicateBehavior.Raise,
         )
 
     def update_step(self, new: StepType):
@@ -189,28 +204,28 @@ class MySQLAdder(Stepper):
             case AdderStep.FetchNodesInfo:
                 return
             case AdderStep.HashRingCalculate:
-                logger.info("Failed to calculate hash ring")
+                logger.warning("Failed to calculate hash ring")
                 return
             case AdderStep.Ping:
-                logger.info("Failed to ping with MySQL server")
+                logger.warning("Failed to ping with MySQL server")
                 return
             case AdderStep.PutNewNodeInfo:
-                logger.info("Failed to put new node info into etcd cluster")
+                logger.warning("Failed to put new node info into etcd cluster")
                 return
             case AdderStep.DataMove:
-                logger.info("Failed to actually move data")
+                logger.warning("Failed to actually move data")
                 await self.datamove_rollback()
                 return
             case AdderStep.UpdateNewNodeState | AdderStep.DataMoveAgain:
-                logger.info("Failed to update new node state")
+                logger.warning("Failed to update new node state")
                 await self.update_new_node_state_rollback()
                 return
             case AdderStep.DeleteFromOldNodes:
-                logger.info("Failed to delete unnecessary data from old nodes")
+                logger.warning("Failed to delete unnecessary data from old nodes")
                 await self.delete_from_old_nodes_rollback()
                 return
             case AdderStep.OptimizeTable:
-                logger.info("Failed to optimize table")
+                logger.warning("Failed to optimize table")
                 await self.optimize_table_rollback()
                 return
             case AdderStep.Done:
@@ -227,6 +242,7 @@ class MySQLAdder(Stepper):
         self, moves: list[Coroutine[None, None, MovedData | None]]
     ) -> list[MovedData]:
         moved_datas: list[MovedData] = list()
+        logger.info(f"Moving data fragments count: {len(moves)}")
         for index, move in enumerate(moves):
             logger.info(f"Move count: {index}/{len(moves)}")
             moved_data: MovedData | None = await move
@@ -249,15 +265,192 @@ class MySQLAdder(Stepper):
 
         return
 
-    def must_exist_deleted_node_etcd_nodes(
+    def must_not_exist_new_node_on_etcd(
         self,
         etcd_data: MySQLEtcdData,
     ):
-        logger.info([i.address_format() for i in etcd_data.nodes])
+        addresses = [i.address_format() for i in etcd_data.nodes]
+        logger.info(f"Now MySQL nodes: {pformat(addresses)}")
+        logger.info(f"New MySQL node: {self.server.address_format()}")
         for node in etcd_data.nodes:
             if node == self.server:
                 raise MySQLEtcdDuplicateNode
 
+        return
+
+    async def _get_mysql_from_etcd(self) -> MySQLEtcdData:
+        etcd_cli = MySQLEtcdClient(
+            host=self.etcd.host,
+            port=self.etcd.port,
+        )
+        self.update_step(AdderStep.FetchNodesInfo)
+        now_data: MySQLEtcdData = await etcd_cli.get()
+        return now_data
+
+    async def no_mysql_nodes(self):
+        etcd_cli = MySQLEtcdClient(
+            host=self.etcd.host,
+            port=self.etcd.port,
+        )
+        _state = State.Run
+        await etcd_cli.add_new_node(
+            self.server,
+            init_state=_state,
+        )
+        node = Server(
+            host=self.server.host,
+            port=self.server.port,
+            state=_state,
+        )
+        await self.ring.add(
+            node=node,
+        )
+
+    async def _do_ping(
+        self,
+        ping_type: PingType,
+    ):
+        match ping_type:
+            case PingType.OnlyTargetServer:
+                ping_nodes: list[Server] = list()
+                for mdp in self.ring.from_to_data:
+                    _from = mdp._from.node
+                    _to = mdp._to
+
+                    if _from not in ping_nodes:
+                        ping_nodes.append(_from)
+                    if _to not in ping_nodes:
+                        ping_nodes.append(_to)
+
+                for node in ping_nodes:
+                    await self.ping_mysql(node)
+            case PingType.AllServer:
+                etcd_cli = MySQLEtcdClient(
+                    host=self.etcd.host,
+                    port=self.etcd.port,
+                )
+                data: MySQLEtcdData = await etcd_cli.get()
+                for _node in data.nodes:
+                    await self.ping_mysql(_node)
+            case PingType.NonPing:
+                pass
+            case _:
+                raise ValueError
+
+    async def _add_new_node(self, sleep_time: int | float):
+        etcd_cli = MySQLEtcdClient(
+            host=self.etcd.host,
+            port=self.etcd.port,
+        )
+        logger.info("Add new node into etcd")
+        await etcd_cli.add_new_node(
+            self.server,
+            init_state=State.Move,
+        )
+        # Wait for node information to propagate
+        await asyncio.sleep(sleep_time)
+
+    async def _update_new_node_state(
+        self,
+        sleep_time: int | float,
+    ):
+        etcd_cli = MySQLEtcdClient(
+            host=self.etcd.host,
+            port=self.etcd.port,
+        )
+        logger.info("Update state of new MySQL node on etcd")
+        await etcd_cli.update_state(
+            server=self.server,
+            state=State.Run,
+        )
+        # Wait for node information to propagate
+        await asyncio.sleep(sleep_time)
+
+    async def delete_from_old_nodes(self):
+        logger.info(
+            "Delete unnecessary data(non owner of hashed) from existed MySQL node"
+        )
+        try:
+            node = Server(
+                host=self.server.host,
+                port=self.server.port,
+                state=State.Move,
+            )
+            self.update_step(AdderStep.DeleteFromOldNodes)
+            await self.ring.delete_from_old_nodes(
+                new_node=node,
+            )
+            self.update_step(AdderStep.OptimizeTable)
+            logger.info("Optimize MySQL nodes with data moved")
+            await self.ring.optimize_table_old_nodes(
+                new_node=node,
+            )
+        except RingNoMoveYet:
+            logger.info("No moved data")
+
+    @add_elapsed_time
+    async def _do(
+        self,
+        ping_type: PingType,
+        delete_from_old: bool,
+        sleep_secs_before_datamove_again: int,
+        sleep_secs_after_etcd_add_new_node: int,
+    ):
+        self.update_step(AdderStep.Init)
+        now_data: MySQLEtcdData = await self._get_mysql_from_etcd()
+
+        if len(now_data.nodes) == 0:
+            self.update_step(AdderStep.PutNewNodeInfo)
+            await self.no_mysql_nodes()
+            self.update_step(AdderStep.Done)
+            return
+
+        self.update_step(AdderStep.HashRingCalculate)
+        self.init_ring(now_etcd=now_data)
+        prev_nodes_length: int = len(self.ring)
+        node = Server(
+            host=self.server.host,
+            port=self.server.port,
+            state=State.Move,
+        )
+        self.must_not_exist_new_node_on_etcd(
+            etcd_data=now_data,
+        )
+        moves: list[Coroutine[None, None, MovedData | None]] = await self.ring.add(
+            node=node,
+        )
+        new_nodes_length: int = len(self.ring)
+        logger.info(f"Nodes count: {prev_nodes_length} => {new_nodes_length}")
+        assert new_nodes_length == prev_nodes_length + 1
+
+        self.update_step(AdderStep.Ping)
+        await self._do_ping(ping_type=ping_type)
+
+        _ft = self.ring._from_to
+        self.update_step(AdderStep.PutNewNodeInfo)
+
+        await self._add_new_node(
+            sleep_time=sleep_secs_after_etcd_add_new_node,
+        )
+
+        self.update_step(AdderStep.DataMove)
+        await self.actually_move_data(moves)
+
+        self.update_step(AdderStep.UpdateNewNodeState)
+        logger.info("Inserted MySQL data from existed node into new node")
+
+        await self._update_new_node_state(
+            sleep_time=sleep_secs_before_datamove_again,
+        )
+        self.update_step(AdderStep.DataMoveAgain)
+
+        assert _ft == self.ring._from_to
+        await self.move_data_again()
+
+        if delete_from_old is True:
+            await self.delete_from_old_nodes()
+
+        self.update_step(AdderStep.Done)
         return
 
     @rollback
@@ -273,140 +466,14 @@ class MySQLAdder(Stepper):
         self.server = server
         try:
             for etcd in self._etcd_info.nodes:
-                self.update_step(AdderStep.Init)
                 try:
-                    etcd_cli = MySQLEtcdClient(
-                        host=etcd.host,
-                        port=etcd.port,
+                    self.etcd = etcd
+                    return await self._do(
+                        ping_type=ping_type,
+                        delete_from_old=delete_from_old,
+                        sleep_secs_before_datamove_again=sleep_secs_before_datamove_again,
+                        sleep_secs_after_etcd_add_new_node=sleep_secs_after_etcd_add_new_node,
                     )
-                    self.update_step(AdderStep.FetchNodesInfo)
-                    now_data: MySQLEtcdData = await etcd_cli.get()
-                except EtcdConnectError:
-                    continue
-
-                if len(now_data.nodes) == 0:
-                    self.update_step(AdderStep.PutNewNodeInfo)
-                    _state = State.Run
-                    await etcd_cli.add_new_node(
-                        server,
-                        init_state=_state,
-                    )
-                    node = Server(
-                        host=server.host,
-                        port=server.port,
-                        state=_state,
-                    )
-                    await self.ring.add(
-                        node=node,
-                    )
-                    self.update_step(AdderStep.Done)
-                    return
-
-                logger.info(now_data)
-                self.update_step(AdderStep.HashRingCalculate)
-                self.init_ring(now_etcd=now_data)
-                prev_nodes_length: int = len(self.ring)
-                node = Server(
-                    host=server.host,
-                    port=server.port,
-                    state=State.Move,
-                )
-                self.must_exist_deleted_node_etcd_nodes(
-                    etcd_data=now_data,
-                )
-                moves: list[
-                    Coroutine[None, None, MovedData | None]
-                ] = await self.ring.add(
-                    node=node,
-                )
-                new_nodes_length: int = len(self.ring)
-                logger.info(f"Nodes count: {prev_nodes_length} => {new_nodes_length}")
-                assert new_nodes_length == prev_nodes_length + 1
-
-                self.update_step(AdderStep.Ping)
-                match ping_type:
-                    case PingType.OnlyTargetServer:
-                        ping_nodes: list[Server] = list()
-                        for mdp in self.ring.from_to_data:
-                            _from = mdp._from.node
-                            _to = mdp._to
-
-                            if _from not in ping_nodes:
-                                ping_nodes.append(_from)
-                            if _to not in ping_nodes:
-                                ping_nodes.append(_to)
-
-                        for node in ping_nodes:
-                            await self.ping_mysql(node)
-                    case PingType.AllServer:
-                        etcd_cli = MySQLEtcdClient(
-                            host=etcd.host,
-                            port=etcd.port,
-                        )
-                        data: MySQLEtcdData = await etcd_cli.get()
-                        for _node in data.nodes:
-                            await self.ping_mysql(_node)
-                    case PingType.NonPing:
-                        pass
-                    case _:
-                        raise ValueError
-
-                logger.info("Add new node: %s..." % (address_from_server(server)))
-                _ft = self.ring._from_to
-                try:
-                    self.update_step(AdderStep.PutNewNodeInfo)
-                    await etcd_cli.add_new_node(
-                        server,
-                        init_state=State.Move,
-                    )
-                    # Wait for node information to propagate
-                    await asyncio.sleep(sleep_secs_after_etcd_add_new_node)
-
-                    logger.info(f"Moving data fragments count: {len(moves)}")
-
-                    self.update_step(AdderStep.DataMove)
-                    moved_datas: list[MovedData] = await self.actually_move_data(moves)
-
-                    self.update_step(AdderStep.UpdateNewNodeState)
-                    logger.info("Inserted MySQL data from existed node into new node")
-                    logger.info("Update state of new MySQL node on etcd")
-                    await etcd_cli.update_state(
-                        server=server,
-                        state=State.Run,
-                    )
-                    logger.info("New MySQL state: %s" % (State.Run.value))
-                    # Wait for node information to propagate
-                    await asyncio.sleep(sleep_secs_before_datamove_again)
-                    self.update_step(AdderStep.DataMoveAgain)
-
-                    node = Server(
-                        host=server.host,
-                        port=server.port,
-                        state=State.Move,
-                    )
-                    assert _ft == self.ring._from_to
-                    await self.move_data_again()
-
-                    logger.info(
-                        "Delete unnecessary data(non owner of hashed) from existed MySQL node"
-                    )
-                    if delete_from_old is True:
-                        try:
-                            self.update_step(AdderStep.DeleteFromOldNodes)
-                            await self.ring.delete_from_old_nodes(
-                                new_node=node,
-                            )
-                            self.update_step(AdderStep.OptimizeTable)
-                            logger.info("Optimize MySQL nodes with data moved")
-                            await self.ring.optimize_table_old_nodes(
-                                new_node=node,
-                            )
-                        except RingNoMoveYet:
-                            logger.info("No moved data")
-
-                    self.update_step(AdderStep.Done)
-                    logger.info("Done !")
-                    return
                 except EtcdConnectError:
                     continue
             else:
