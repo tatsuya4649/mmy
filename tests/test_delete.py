@@ -11,8 +11,15 @@ import pytest
 import pytest_asyncio
 from aiomysql.cursors import DictCursor
 from mmy.mysql.add import PingType
-from mmy.mysql.client import MySQLClient, MySQLInsertDuplicateBehavior
+from mmy.mysql.client import (
+    CHSIter,
+    MySQLClient,
+    MySQLInsertDuplicateBehavior,
+    MySQLKeys,
+    TableName,
+)
 from mmy.mysql.delete import MySQLDeleter, MySQLDeleterNoServer
+from mmy.mysql.reshard import MySQLReshard
 from mmy.mysql.sql import SQLPoint
 from mmy.parse import MmyYAML
 from mmy.ring import MySQLRing
@@ -20,6 +27,12 @@ from mmy.server import Server, State, _Server
 from rich import print
 
 from ._mysql import ROOT_USERINFO, TEST_TABLE2, mmy_info
+from .test_add import (
+    _original_consistent_hashing_delete,
+    consistent_hashing_delete,
+    consistent_hashing_select,
+    get_already_hashed_key,
+)
 from .test_etcd import etcd_flush_all_data, etcd_put_mysql_container
 from .test_mysql import (
     DockerMySQL,
@@ -35,7 +48,7 @@ logger = logging.getLogger(__name__)
 class TestDelete:
     GENERAETE_REPEAT: int = 24
     MIN_COUNT: int = 100000
-    LOG_STEP: int = 1000
+    LOG_STEP: int = 10000
     sleep_secs_before_datamove_again: float = 0.1
 
     @pytest.mark.asyncio
@@ -220,7 +233,7 @@ class TestDelete:
         logger.info("Inconsistency test with post datas")
         for data_index, item in enumerate(post_data):
             if data_index % self.LOG_STEP == 0:
-                logger.info(f"Done: {data_index/len(post_data)}")
+                logger.info(f"Done: {data_index}/{len(post_data)}")
 
             i = 0
             for container in mysql_containers:
@@ -316,7 +329,7 @@ class TestDelete:
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
             for data_index, post in enumerate(post_data):
                 if data_index % self.LOG_STEP == 0:
-                    logger.info(f"Done: {data_index/len(post_data)}")
+                    logger.info(f"Done: {data_index}/{len(post_data)}")
 
                 key = post["id"]  # not AUTO_INCREMENT
                 nodeinfo = ring.get(key)
@@ -354,6 +367,7 @@ class TestDelete:
         self,
         etcd_flush_all_data,
         mmy_info: MmyYAML,
+        mocker,
     ):
         """
         Setup all MySQL nodes with random data,
@@ -363,67 +377,82 @@ class TestDelete:
         await etcd_put_mysql_container(mysql_containers)
         for container in mysql_containers:
             await up_mysql_docker_container(container)
+            await delete_all_table(container, mmy_info)
 
-            # Connection to MySQL without mmy proxy.
-            async with aiomysql.connect(
-                host=str(container.value.host),
-                port=container.value.port,
-                user=ROOT_USERINFO.user,
-                cursorclass=DictCursor,
-                password=ROOT_USERINFO.password,
-                db=mmy_info.mysql.db,
-            ) as connect:
-                # Delete all table data from container
-                await delete_all_table(container, mmy_info)
+        from .test_ring import SAMPLE_MD5_ROWS_COUNT, sample_md5_bulk
 
-                cur = await connect.cursor()
-                await cur.execute(
-                    "CALL generate_random_post(%d, %d)"
-                    % (self.GENERAETE_REPEAT, self.MIN_COUNT)
+        BULK_INSERT_SIZE: int = 10000
+
+        # Insert generated data into the first container of MySQL.
+        async with aiomysql.connect(
+            host=str(mysql_containers[0].value.host),
+            port=mysql_containers[0].value.port,
+            user=ROOT_USERINFO.user,
+            cursorclass=DictCursor,
+            password=ROOT_USERINFO.password,
+            db=mmy_info.mysql.db,
+        ) as connect:
+            cur = await connect.cursor()
+
+            def _get_random_bytes() -> bytes:
+                return str(random.uniform(0, 100)).encode("utf-8")
+
+            logger.info(f"Insert random data: {SAMPLE_MD5_ROWS_COUNT} rows")
+            for index, bulk in enumerate(sample_md5_bulk(bulk_count=BULK_INSERT_SIZE)):
+                logger.info(f"{index}: Insert size {index*BULK_INSERT_SIZE}")
+                await cur.executemany(
+                    query=f"INSERT INTO {TEST_TABLE2}(\
+                        id, \
+                        md5, \
+                        title, \
+                        duration, \
+                        do_on \
+                        ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
+                    args=[
+                        {
+                            "id": i,
+                            "md5": hashlib.md5(_get_random_bytes()).hexdigest(),
+                            "title": hashlib.sha256(_get_random_bytes()).hexdigest(),
+                            "duration": random.uniform(0, 10),
+                            "do_on": datetime.now(timezone.utc),
+                        }
+                        for i in bulk
+                    ],
                 )
-                await connect.commit()
 
-        ring = MySQLRing(
+            await connect.commit()
+
+        reshard = MySQLReshard(
             mysql_info=mmy_info.mysql,
-            init_nodes=[
-                _Server(
-                    host=con.value.host,
-                    port=con.value.port,
-                )
-                for con in mysql_containers
-            ],
-            insert_duplicate_behavior=MySQLInsertDuplicateBehavior.Raise,
+            etcd_info=mmy_info.etcd,
         )
-        # Delete not owned data from MySQL containers
-        for contianer in mysql_containers:
-            node = Server(
-                host=contianer.value.host,
-                port=contianer.value.port,
-                state=State.Unknown,
+
+        mocker.patch(
+            "mmy.mysql.client.MySQLClient.consistent_hashing_select",
+            side_effect=consistent_hashing_select,
+            autospec=True,
+        )
+        mocker.patch(
+            "mmy.mysql.client.MySQLClient.consistent_hashing_delete",
+            side_effect=consistent_hashing_delete,
+            autospec=True,
+        )
+
+        def get_instance(self, data: Any):
+            return get_already_hashed_key(
+                ring=self._hr,
+                key=data,
             )
-            for md in ring.not_owner_points(node):
-                cli = MySQLClient(
-                    host=node.host,
-                    port=node.port,
-                    auth=mmy_info.mysql,
-                )
-                for table in ring.table_names():
-                    await cli.consistent_hashing_delete(
-                        table=table,
-                        start=SQLPoint(
-                            point=md.start_point,
-                            equal=md.start_equal,
-                            greater=True,
-                            less=False,
-                        ),
-                        end=SQLPoint(
-                            point=md.end_point,
-                            equal=md.end_equal,
-                            greater=False,
-                            less=True,
-                        ),
-                        _or=md._or,
-                    )
+
+        mocker.patch(
+            "mmy.ring.Ring.get_instance",
+            side_effect=get_instance,
+            autospec=True,
+        )
+        await reshard.do(
+            delete_unnecessary=True,
+        )
+        logger.info("Finish resharding data")
         return
 
     def _deleter_do(
@@ -461,8 +490,10 @@ class TestDelete:
             etcd_info=mmy_info.etcd,
         )
         for index, container in enumerate(delete_cons):
+            logger.info(
+                f"Test for deleting container({container.name}) {index}/{len(delete_cons)}"
+            )
             mocker.stopall()
-            before_delete_post_count: int = 0
 
             async def actually_move_data(*args, **kwargs):
                 _deleter: MySQLDeleter = args[0]
@@ -475,55 +506,64 @@ class TestDelete:
                 )
                 logger.info("it emulates inserting data while moving data to new node")
 
+                insert_values: list[dict[str, Any]] = list()
+                # Create insert data
                 for i in range(COUNT):
-                    if i % self.LOG_STEP == 0:
-                        logger.info(f"INSERT {i}/{COUNT}")
+                    if i % 10 == 0:
+                        logger.info(f"INSERT after firstly moving data: {i}/{COUNT}")
 
                     while True:
-                        _id = str(time.time_ns())
-                        _title = hashlib.sha256(_id.encode("utf-8")).hexdigest()
-                        _md5 = hashlib.md5(_id.encode("utf-8")).hexdigest()
+                        _b = str(time.time_ns())
+                        _id = hashlib.md5(_b.encode("utf-8")).hexdigest()
+                        _title = hashlib.sha256(_b.encode("utf-8")).hexdigest()
+                        _md5 = hashlib.md5(
+                            str(time.time_ns()).encode("utf-8")
+                        ).hexdigest()
                         _duration = random.uniform(0, 10)
                         _do_on = datetime.now(timezone.utc)
 
-                        _node = _prev_ring.get(data=_id)
-                        _instance: Server = _node["instance"]
+                        _instance: Server = get_already_hashed_key(_prev_ring._hr, _id)
                         if (
                             _instance.address_format()
                             != _deleter.server.address_format()
                         ):
                             continue
 
-                        # mysql random generate
-                        async with aiomysql.connect(
-                            host=str(_instance.host),
-                            port=_instance.port,
-                            user=ROOT_USERINFO.user,
-                            cursorclass=DictCursor,
-                            password=ROOT_USERINFO.password,
-                            db=mmy_info.mysql.db,
-                        ) as connect:
-                            cur = await connect.cursor()
-                            async with cur:
-                                await cur.execute(
-                                    query=f"INSERT INTO {TEST_TABLE2}(\
-                                        id, \
-                                        md5, \
-                                        title, \
-                                        duration, \
-                                        do_on \
-                                        ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
-                                    args={
-                                        "id": _id,
-                                        "md5": _md5,
-                                        "title": _title,
-                                        "duration": _duration,
-                                        "do_on": _do_on,
-                                    },
-                                )
-                            await connect.commit()
-
+                        insert_values.append(
+                            {
+                                "id": _id,
+                                "md5": _md5,
+                                "title": _title,
+                                "duration": _duration,
+                                "do_on": _do_on,
+                            }
+                        )
                         break
+
+                # mysql random generate
+                async with aiomysql.connect(
+                    host=str(_instance.host),
+                    port=_instance.port,
+                    user=ROOT_USERINFO.user,
+                    cursorclass=DictCursor,
+                    password=ROOT_USERINFO.password,
+                    db=mmy_info.mysql.db,
+                ) as connect:
+                    cur = await connect.cursor()
+                    async with cur:
+                        await cur.executemany(
+                            query=f"INSERT INTO {TEST_TABLE2}(\
+                                id, \
+                                md5, \
+                                title, \
+                                duration, \
+                                do_on \
+                                ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
+                            args=insert_values,
+                        )
+                    await connect.commit()
+
+                logger.info("Ok, Insert random after moving data")
 
                 return res
 
@@ -533,12 +573,24 @@ class TestDelete:
                 autospec=True,
             )
 
+            mocker.patch(
+                "mmy.mysql.client.MySQLClient.consistent_hashing_select",
+                side_effect=consistent_hashing_select,
+                autospec=True,
+            )
+            mocker.patch(
+                "mmy.mysql.client.MySQLClient.consistent_hashing_delete",
+                side_effect=consistent_hashing_delete,
+                autospec=True,
+            )
+
             _c = container.value
             _server = _Server(
                 host=_c.host,
                 port=_c.port,
             )
 
+            before_delete_post_count: int = 0
             for _mysql in cons:
                 async with aiomysql.connect(
                     host=str(_mysql.value.host),
@@ -600,6 +652,7 @@ class TestDelete:
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
 
             for con in cons:
+                logger.info(f"Test {con.name}")
                 async with aiomysql.connect(
                     host=str(con.value.host),
                     port=con.value.port,
@@ -612,15 +665,14 @@ class TestDelete:
                         if data_index % self.LOG_STEP == 0:
                             logger.info(f"Done: {data_index}/{len(post_data)}")
 
-                        key = post["id"]  # not AUTO_INCREMENT
-                        nodeinfo = ring.get(key)
-                        instance = nodeinfo["instance"]
+                        _id: str = post["id"]  # not AUTO_INCREMENT
+                        instance = get_already_hashed_key(ring._hr, _id)
 
                         cur = await connect.cursor()
                         await cur.execute(
                             f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
                             {
-                                "_id": key,
+                                "_id": _id,
                             },
                         )
                         _f = await cur.fetchone()
@@ -635,7 +687,7 @@ class TestDelete:
                                 assert _count == 0
                         except AssertionError as e:
                             logger.info("#################")
-                            logger.info(key)
+                            logger.info(_id)
                             logger.info(con.name)
                             logger.info(instance)
                             raise e

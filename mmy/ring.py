@@ -662,9 +662,6 @@ class Ring(RingMeta, RingHandler):
                 insert_ignore=None,
             )
             self._from_to.append(mdp)
-            logger.info(
-                f"{_from.start_point[:self.LENGTH]}~{_from.end_point[:self.LENGTH]}"
-            )
             _cos.append(self._move(mdp))
 
         assert len(_cos) == self._default_vnodes

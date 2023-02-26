@@ -382,6 +382,7 @@ class MySQLClient:
         table: TableName,
         limit_once: int = 10000,
         iter_type: Type[GetAsyncIter] | None = None,
+        **kwargs,
     ) -> AsyncGenerator[list[dict[str, Any]], None]:
         _nclass: Type[_AbcGetAsyncIter] = _GetAsyncIter
         if iter_type is not None:
@@ -391,6 +392,7 @@ class MySQLClient:
             table=table,
             debug=self._debug,
             client=self,
+            **kwargs,
         )
         async for frag in _gai:
             yield frag
@@ -405,68 +407,14 @@ class MySQLClient:
     ) -> AsyncGenerator[list[dict[str, Any]], None]:
         keys: list[MySQLKeys] = await self.primary_keys_info(table)
 
-        class CHSIter(_AbcGetAsyncIter):
-            def __init__(
-                self,
-                table: str,
-                limit_once: int,
-                debug: bool,
-                client: MySQLClient,
-            ):
-                self._table = table
-                self._limit_once = limit_once
-                self._i = 0
-                self._hash_fn = "MD5"
-                self._rows_count: int | None = None
-                self.logger = logging.getLogger(__name__)
-                self._debug: bool = debug
-                self._client = client
-
-            def __aiter__(self):
-                self._i = 0
-                return self
-
-            async def __anext__(self):
-                primary_key: MySQLKeys = keys[0]
-                primary_keyname: str = primary_key.Column_name
-                and_or = "OR" if _or else "AND"
-                if self._rows_count is None:
-                    async with self._client._connect(table) as connect:
-                        cursor = await connect.cursor()
-                        async with cursor:
-                            await cursor.execute(
-                                f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s",
-                                {
-                                    "start": start.point,
-                                    "end": end.point,
-                                },
-                            )
-                            res = await cursor.fetchone()
-                            assert res["rows_count"] is not None
-                            self._rows_count = int(res["rows_count"])
-
-                while self._i < self._rows_count:
-                    async with self._client._connect(table) as connect:
-                        cursor = await connect.cursor()
-                        async with cursor:
-                            await cursor.execute(
-                                f"SELECT * FROM {self._table} WHERE {self._hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {self._hash_fn}({primary_keyname}){end.greater_less}%(end)s LIMIT %(limit)s OFFSET %(offset)s",
-                                {
-                                    "start": start.point,
-                                    "end": end.point,
-                                    "limit": self._limit_once,
-                                    "offset": self._i,
-                                },
-                            )
-                            _frag = await cursor.fetchall()
-                            self._i += len(_frag)
-                            return _frag
-                raise StopAsyncIteration
-
         return self.select(
             table=table,
             limit_once=limit_once,
             iter_type=CHSIter,
+            primary_key=keys[0],
+            start=start,
+            end=end,
+            _or=_or,
         )
 
     @multiple_retry_mysql_when_connection_error
@@ -476,17 +424,24 @@ class MySQLClient:
         start: SQLPoint,
         end: SQLPoint,
         _or: bool,
+        hash_fn: str | None = "MD5",
     ) -> int:
         keys: list[MySQLKeys] = await self.primary_keys_info(table)
         primary_key: MySQLKeys = keys[0]
         primary_keyname: str = primary_key.Column_name
-        _hash_fn: str = "MD5"
         and_or = "OR" if _or else "AND"
+
+        def _hash_fn(primary_keyname: str):
+            if hash_fn is None:
+                return primary_keyname
+            else:
+                return f"{hash_fn}({primary_keyname})"
+
         async with self._connect(table) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 await cursor.execute(
-                    f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
+                    f"SELECT COUNT(*) as rows_count FROM {table} WHERE {_hash_fn(primary_keyname)}{start.greater_less}%(start)s {and_or} {_hash_fn(primary_keyname)}{end.greater_less}%(end)s",
                     {
                         "start": start.point,
                         "end": end.point,
@@ -503,7 +458,7 @@ class MySQLClient:
 
                 async def _actually_delete():
                     affected_rows = await cursor.execute(
-                        f"DELETE FROM {table} WHERE {_hash_fn}({primary_keyname}){start.greater_less}%(start)s {and_or} {_hash_fn}({primary_keyname}){end.greater_less}%(end)s",
+                        f"DELETE FROM {table} WHERE {_hash_fn(primary_keyname)}{start.greater_less}%(start)s {and_or} {_hash_fn(primary_keyname)}{end.greater_less}%(end)s",
                         {
                             "start": start.point,
                             "end": end.point,
@@ -638,3 +593,77 @@ class MySQLClient:
                 await cursor.execute(f"DELETE FROM {table}")
             await connect.commit()
         return
+
+
+class CHSIter(_AbcGetAsyncIter):
+    def __init__(
+        self,
+        table: TableName,
+        limit_once: int,
+        debug: bool,
+        client: MySQLClient,
+        primary_key: MySQLKeys,
+        _or: str,
+        start: SQLPoint,
+        end: SQLPoint,
+        hash_fn: str | None = "MD5",
+    ):
+        self._table = table
+        self._limit_once = limit_once
+        self._i = 0
+        self._hash_fn = hash_fn
+        self._rows_count: int | None = None
+        self.logger = logging.getLogger(__name__)
+        self._debug: bool = debug
+        self._client = client
+        self._primary_key = primary_key
+        self._or = _or
+        self._start = start
+        self._end = end
+
+    def __aiter__(self):
+        self._i = 0
+        return self
+
+    async def __anext__(self):
+        def _hash_fn_exp(primary_keyname: str):
+            if self._hash_fn is None:
+                return primary_keyname
+            else:
+                return f"{self._hash_fn}({primary_keyname})"
+
+        primary_keyname: str = self._primary_key.Column_name
+        and_or = "OR" if self._or else "AND"
+        if self._rows_count is None:
+            async with self._client._connect(self._table) as connect:
+                cursor = await connect.cursor()
+                async with cursor:
+                    await cursor.execute(
+                        f"SELECT COUNT(*) as rows_count FROM {self._table} WHERE {_hash_fn_exp(primary_keyname)}{self._start.greater_less}%(start)s {and_or} {_hash_fn_exp(primary_keyname)}{self._end.greater_less}%(end)s",
+                        {
+                            "start": self._start.point,
+                            "end": self._end.point,
+                        },
+                    )
+                    res = await cursor.fetchone()
+                    assert res["rows_count"] is not None
+                    self._rows_count = int(res["rows_count"])
+
+        while self._i < self._rows_count:
+            async with self._client._connect(self._table) as connect:
+                cursor = await connect.cursor()
+                async with cursor:
+                    await cursor.execute(
+                        f"SELECT * FROM {self._table} WHERE {_hash_fn_exp(primary_keyname)}{self._start.greater_less}%(start)s {and_or} {_hash_fn_exp(primary_keyname)}{self._end.greater_less}%(end)s LIMIT %(limit)s OFFSET %(offset)s",
+                        {
+                            "start": self._start.point,
+                            "end": self._end.point,
+                            "limit": self._limit_once,
+                            "offset": self._i,
+                        },
+                    )
+                    _frag = await cursor.fetchall()
+                    self._i += len(_frag)
+                    return _frag
+
+        raise StopAsyncIteration

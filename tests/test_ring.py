@@ -1,6 +1,7 @@
 import logging
 import random
 from hashlib import md5
+from typing import Generator
 
 import pytest
 from mmy.ring import MDP, Md, MySQLRing
@@ -9,6 +10,33 @@ from mmy.server import Server, State
 from ._mysql import mmy_info
 
 logger = logging.getLogger(__name__)
+
+SAMPLE_MD5_BYTES: int = 2
+SAMPLE_MD5_ROWS_COUNT: int = 256**SAMPLE_MD5_BYTES
+
+
+def sample_md5_bulk(bulk_count: int) -> Generator[list[str], None, None]:
+    from hashlib import md5
+
+    _sample_md5 = md5(b"a").hexdigest()
+    _sample_md5_length = len(_sample_md5)
+
+    a = "0" * _sample_md5_length
+    i = int(a, 16)
+    _bytes = SAMPLE_MD5_BYTES
+    _padding_length = _sample_md5_length - _bytes * 2
+    res = list()
+    for i in range(0, SAMPLE_MD5_ROWS_COUNT - 1):
+        i += 1
+        b = "{i:0{width}x}".format(i=i, width=2 * _bytes)
+        b += "0" * _padding_length
+
+        res.append(b)
+        if len(res) == bulk_count:
+            yield res
+            res.clear()
+    else:
+        yield res
 
 
 class TestMySQLRing:
@@ -172,25 +200,3 @@ class TestMySQLRing:
         _ps: list[Md] = ring.not_owner_points(first_node)
         for p in _ps:
             assert p.node != first_node
-
-    def sample_md5_gen(self) -> list[str]:
-        from hashlib import md5
-
-        _sample_md5 = md5(b"a").hexdigest()
-        _sample_md5_length = len(_sample_md5)
-
-        a = "0" * _sample_md5_length
-        i = int(a, 16)
-        BYTES = 3
-        COUNT = 256**BYTES
-        _padding_length = _sample_md5_length - BYTES * 2
-        res = list()
-        for i in range(0, COUNT):
-            i += 1
-            b = "{i:0{width}x}".format(i=i, width=2 * BYTES)
-            b += "0" * _padding_length
-
-            res.append(b)
-
-        res.sort()
-        return res

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -23,7 +24,14 @@ from python_on_whales import docker
 from rich import print
 
 from ._mysql import TEST_TABLE2, mmy_info
-from .test_mysql import DockerMySQL, container, up_mysql_docker_container
+from .test_mysql import (
+    DockerMySQL,
+    container,
+    delete_all_table,
+    fix_up_mysql_docker_containers,
+    get_mysql_docker_for_test,
+    up_mysql_docker_container,
+)
 
 HOST = "127.0.0.1"
 PROXY_SERVER_STARTUP_TIMEOUT: int = 10
@@ -46,6 +54,9 @@ def mysql_hosts():
         )
     _mh.update(_servers)
     return _mh
+
+
+LOG_STEP: int = 1000
 
 
 @asynccontextmanager
@@ -257,78 +268,91 @@ async def test_SSL(
         await connect.ping()
 
 
-@pytest.mark.asyncio
-async def test_select(
-    proxy_server_start,
-):
-    random_key = str(time.time_ns())
+def generate_random_key() -> str:
+    _b = str(time.time_ns())
+    key = hashlib.md5(_b.encode("utf-8")).hexdigest()
+    return key
 
-    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
-        cursor = await connect.cursor()
-        async with cursor:
-            length = 100
-            await cursor.execute(
-                key=random_key,
-                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE2, length),
-            )
-            res = await cursor.fetchall()
-            assert isinstance(res, list)
-            assert len(res) == length
+
+def generate_random_title() -> str:
+    _b = str(time.time_ns())
+    key = hashlib.sha384(_b.encode("utf-8")).hexdigest()
+    return key
 
 
 @pytest.mark.asyncio
 async def test_insert(
     proxy_server_start,
 ):
-    random_key = str(time.time_ns())
+    _id = generate_random_key()
 
-    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
+    async with fix_proxy_connect(_id, proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             res = await cursor.execute(
-                key=random_key,
-                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE2, random_key),
+                key=_id,
+                query=f"INSERT INTO {TEST_TABLE2} (id) VALUES (%(id)s)",
+                args={
+                    "id": _id,
+                },
             )
             assert res == 1
 
         await connect.commit()
 
+        cursor = await connect.cursor()
+        async with cursor:
+            await cursor.execute(
+                key=_id,
+                query=f"SELECT * FROM {TEST_TABLE2} WHERE id=%(id)s",
+                args={
+                    "id": _id,
+                },
+            )
+            res = await cursor.fetchall()
+            assert isinstance(res, list)
+            assert len(res) == 1
 
-count = 10000
+
+COUNT = 1000
 
 
 @pytest.mark.asyncio
 async def test_insert_many(
     proxy_server_start,
 ):
-    import random
-
-    random_key = random.randint(1000000, 10000000)
     keys = list()
-    for i in range(count):
-        if i % 100 == 0:
-            logger.info(f"Complete: {int(100*(i/count))}%")
+    for i in range(COUNT):
+        _id = generate_random_key()
+        _title = generate_random_title()
+        if i % LOG_STEP == 0:
+            logger.info(f"Complete: {i}/{COUNT}")
 
-        _rk = str(random_key + i)
-        keys.append(_rk)
-        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+        keys.append(_id)
+        async with fix_proxy_connect(_id, proxy_server_start) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 res = await cursor.execute(
-                    key=_rk,
-                    query="INSERT INTO %s (id, name) VALUES (%s, %s)"
-                    % (TEST_TABLE2, _rk, _rk),
+                    key=_id,
+                    query=f"INSERT INTO {TEST_TABLE2} (id, title) VALUES (%(id)s, %(title)s)",
+                    args={
+                        "id": _id,
+                        "title": _title,
+                    },
                 )
                 assert res == 1
 
             await connect.commit()
 
-        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+        async with fix_proxy_connect(_id, proxy_server_start) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 await cursor.execute(
-                    key=_rk,
-                    query="SELECT * FROM %s WHERE id=%s" % (TEST_TABLE2, _rk),
+                    key=_id,
+                    query=f"SELECT * FROM {TEST_TABLE2} WHERE id=%(id)s",
+                    args={
+                        "id": _id,
+                    },
                 )
                 res = len(await cursor.fetchall())
                 assert res == 1
@@ -338,24 +362,28 @@ async def test_insert_many(
 async def test_update(
     proxy_server_start,
 ):
-    random_key = int(time.time_ns())
-    random_id = random.randint(100000, 200000)
+    random_id: str = generate_random_key()
 
-    async with fix_proxy_connect(str(random_key), proxy_server_start) as connect:
+    async with fix_proxy_connect(random_id, proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             res = await cursor.execute(
                 key=str(random_id),
-                query="INSERT INTO %s (id, name) VALUES (%d, %s)"
-                % (TEST_TABLE2, random_id, str(random_key)),
+                query=f"INSERT INTO {TEST_TABLE2} (id, title) VALUES (%(id)s, %(title)s)",
+                args={
+                    "id": random_id,
+                    "title": generate_random_title(),
+                },
             )
             assert res == 1
 
-            new_name = str(time.time_ns())
             res = await cursor.execute(
-                key=str(random_key),
-                query="UPDATE %s SET name=%s WHERE id=%d"
-                % (TEST_TABLE2, new_name, random_id),
+                key=str(random_id),
+                query=f"UPDATE {TEST_TABLE2} SET title=%(title)s WHERE id=%(id)s",
+                args={
+                    "title": generate_random_title(),
+                    "id": random_id,
+                },
             )
             assert res == 1
 
@@ -366,36 +394,53 @@ async def test_update(
 async def test_update_many(
     proxy_server_start,
 ):
-    import random
-
-    random_key = random.randint(1000000, 10000000)
     keys = list()
-    for i in range(count):
-        if i % 100 == 0:
-            logger.info(f"Complete: {int(100*(i/count))}%")
+    for i in range(COUNT):
+        random_id: str = generate_random_key()
+        title: str = generate_random_title()
+        if i % LOG_STEP == 0:
+            logger.info(f"Complete: {i}/{COUNT}")
 
-        _rk = str(random_key + i)
-        keys.append(_rk)
-        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+        keys.append(random_id)
+        async with fix_proxy_connect(random_id, proxy_server_start) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 res = await cursor.execute(
-                    key=_rk,
-                    query="INSERT INTO %s (id, name) VALUES (%s, %s)"
-                    % (TEST_TABLE2, _rk, _rk),
+                    key=random_id,
+                    query=f"INSERT INTO {TEST_TABLE2} (id, title) VALUES (%(id)s, %(title)s)",
+                    args={
+                        "id": random_id,
+                        "title": title,
+                    },
                 )
                 assert res == 1
 
             await connect.commit()
 
-        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
-            _random_key = random.randint(1000000, 10000000)
-            _nrk = str(_random_key)
+        async with fix_proxy_connect(random_id, proxy_server_start) as connect:
+            new_title: str = generate_random_title()
+            cursor = await connect.cursor()
+            async with cursor:
+                res = await cursor.execute(
+                    key=random_id,
+                    query=f"UPDATE {TEST_TABLE2} SET title=%(title)s WHERE id=%(id)s",
+                    args={
+                        "id": random_id,
+                        "title": new_title,
+                    },
+                )
+                assert res == 1
+
+            await connect.commit()
+
             cursor = await connect.cursor()
             async with cursor:
                 await cursor.execute(
-                    key=_rk,
-                    query="UPDATE %s SET name=%s" % (TEST_TABLE2, _nrk),
+                    key=random_id,
+                    query=f"SELECT * FROM {TEST_TABLE2} WHERE id=%(id)s",
+                    args={
+                        "id": random_id,
+                    },
                 )
                 res = len(await cursor.fetchall())
                 assert res == 1
@@ -405,14 +450,19 @@ async def test_update_many(
 async def test_delete(
     proxy_server_start,
 ):
-    random_key = str(time.time_ns())
+    random_id: str = generate_random_key()
+    title: str = generate_random_title()
 
-    async with fix_proxy_connect(random_key, proxy_server_start) as connect:
+    async with fix_proxy_connect(random_id, proxy_server_start) as connect:
         cursor = await connect.cursor()
         async with cursor:
             res = await cursor.execute(
-                key=random_key,
-                query="INSERT INTO %s (name) VALUES (%s)" % (TEST_TABLE2, random_key),
+                key=random_id,
+                query=f"INSERT INTO {TEST_TABLE2} (id, title) VALUES (%(id)s, %(title)s)",
+                args={
+                    "id": random_id,
+                    "title": title,
+                },
             )
             assert res == 1
 
@@ -421,8 +471,12 @@ async def test_delete(
         cursor = await connect.cursor()
         async with cursor:
             res = await cursor.execute(
-                key=random_key,
-                query="DELETE FROM %s WHERE name=%s" % (TEST_TABLE2, random_key),
+                key=random_id,
+                query=f"DELETE FROM {TEST_TABLE2} WHERE id=%(id)s AND title=%(title)s",
+                args={
+                    "id": random_id,
+                    "title": title,
+                },
             )
             assert res == 1
 
@@ -432,35 +486,67 @@ async def test_delete(
 @pytest.mark.asyncio
 async def test_delete_many(
     proxy_server_start,
+    mmy_info,
 ):
-    import random
 
-    random_key = random.randint(1000000, 10000000)
-    selects = list()
-    _rk = str(random_key)
-    async with fix_proxy_connect(_rk, proxy_server_start) as connect:
-        cursor = await connect.cursor()
-        async with cursor:
-            await cursor.execute(
-                key=_rk,
-                query="SELECT * FROM %s LIMIT %d" % (TEST_TABLE2, count),
-            )
-            selects.extend(await cursor.fetchall())
+    for mysql in get_mysql_docker_for_test():
+        await up_mysql_docker_container(mysql)
+        await delete_all_table(mysql, mmy_info)
 
-    for index, row in enumerate(selects):
-        if index % 100 == 0:
-            logger.info(f"Complete: {int(100*(index/count))}%")
+    ids = list()
+    for i in range(COUNT):
+        if i % LOG_STEP == 0:
+            logger.info(f"INSERTED {i}/{COUNT}")
 
-        async with fix_proxy_connect(_rk, proxy_server_start) as connect:
+        random_id: str = generate_random_key()
+        title: str = generate_random_title()
+        async with fix_proxy_connect(random_id, proxy_server_start) as connect:
             cursor = await connect.cursor()
             async with cursor:
                 res = await cursor.execute(
-                    key=_rk,
-                    query="DELETE FROM %s WHERE id=%s" % (TEST_TABLE2, row["id"]),
+                    key=random_id,
+                    query=f"INSERT INTO {TEST_TABLE2}(id, title) VALUES (%(id)s, %(title)s)",
+                    args={
+                        "id": random_id,
+                        "title": title,
+                    },
                 )
                 assert res == 1
 
             await connect.commit()
+        ids.append(random_id)
+
+    for index, _id in enumerate(ids):
+        if index % LOG_STEP == 0:
+            logger.info(f"Complete: {index}/{len(ids)}")
+
+        async with fix_proxy_connect(_id, proxy_server_start) as connect:
+            cursor = await connect.cursor()
+            async with cursor:
+                await cursor.execute(
+                    key=_id,
+                    query=f"SELECT * FROM {TEST_TABLE2} WHERE id=%(id)s",
+                    args={
+                        "id": _id,
+                    },
+                )
+                res = await cursor.fetchall()
+                assert len(res) == 1
+
+            cursor = await connect.cursor()
+            async with cursor:
+                res = await cursor.execute(
+                    key=_id,
+                    query=f"DELETE FROM {TEST_TABLE2} WHERE id=%(id)s",
+                    args={
+                        "id": _id,
+                    },
+                )
+                assert res == 1
+
+            await connect.commit()
+
+    return
 
 
 @pytest.mark.asyncio
@@ -494,7 +580,7 @@ async def test_load_infile(
             with pytest.raises(MmyLocalInfileUnsupportError):
                 await cursor.execute(
                     key=random_key,
-                    query='LOAD DATA LOCAL INFILE "%s" INTO TABLE post FIELDS TERMINATED BY "," (@1) SET name=@1'
+                    query='LOAD DATA LOCAL INFILE "%s" INTO TABLE post FIELDS TERMINATED BY "," (@1) SET title=@1'
                     % (resource_user),
                 )
 
@@ -582,11 +668,9 @@ async def test_update_etcd_data(
     from pymysql.err import OperationalError
 
     from .test_etcd import DockerEtcd
-    from .test_mysql import get_mysql_docker_for_test, up_mysql_docker_container
 
     mysql_hosts = MySQLHosts()
 
-    COUNT = 1000
     RETRY_COUNT = 4
     RETRY_INTERVAL = 2
 
@@ -671,8 +755,8 @@ async def test_update_etcd_data(
 
         async def _main():
             for i in range(COUNT):
-                if i % 100 == 0:
-                    logger.info(f"Complete {int(100*i/COUNT)}%")
+                if i % LOG_STEP == 0:
+                    logger.info(f"Complete {i}/{COUNT}")
                 random_key = str(time.time_ns())
                 sleep_time = random.uniform(0, 0.3)
                 await asyncio.sleep(sleep_time)

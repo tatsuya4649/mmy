@@ -1,4 +1,7 @@
+import hashlib
 import logging
+import random
+from datetime import datetime, timezone
 from typing import Any
 
 import aiomysql
@@ -12,18 +15,26 @@ from mmy.ring import MySQLRing
 from mmy.server import Server, State
 
 from ._mysql import ROOT_USERINFO, TEST_TABLE2, delete_all_table, mmy_info
+from .test_add import (
+    _original_consistent_hashing_delete,
+    consistent_hashing_delete,
+    consistent_hashing_select,
+    get_already_hashed_key,
+)
 from .test_etcd import up_etcd_docker_containers
 from .test_mysql import (
     DockerMySQL,
     get_mysql_docker_for_test,
     up_mysql_docker_container,
 )
+from .test_ring import SAMPLE_MD5_ROWS_COUNT, sample_md5_bulk
 
 logger = logging.getLogger(__name__)
 
 
 class TestReshard:
     DATA_LENGTH = 10000
+    LOG_STEP: int = 10000
 
     def _generate_random_data(self, index: int) -> list[dict[str, Any]]:
         res: list[dict[str, Any]] = list()
@@ -91,6 +102,9 @@ class TestReshard:
 
     @pytest_asyncio.fixture
     async def setup_mysql_nodes(self, mmy_info):
+
+        BULK_INSERT_SIZE = 1000
+
         for index, mysql_container in enumerate(get_mysql_docker_for_test()):
             # Start MySQL container
             await up_mysql_docker_container(mysql_container)
@@ -100,18 +114,91 @@ class TestReshard:
                 container=mysql_container,
                 index=index,
             )
+            async with aiomysql.connect(
+                host=str(DockerMySQL.MySQL1.value.host),
+                port=DockerMySQL.MySQL1.value.port,
+                user=ROOT_USERINFO.user,
+                cursorclass=DictCursor,
+                password=ROOT_USERINFO.password,
+                db=mmy_info.mysql.db,
+            ) as connect:
+
+                cur = await connect.cursor()
+
+                def _get_random_bytes() -> bytes:
+                    return str(random.uniform(0, 100)).encode("utf-8")
+
+                logger.info(f"Insert random data: {SAMPLE_MD5_ROWS_COUNT} rows")
+                for bulk_index, bulk in enumerate(
+                    sample_md5_bulk(bulk_count=BULK_INSERT_SIZE)
+                ):
+                    logger.info(
+                        f"{bulk_index}: Insert size {bulk_index*BULK_INSERT_SIZE}"
+                    )
+                    _ds = list()
+                    for i in bulk:
+                        _id = i[:-1] + f"{index}"
+                        _ds.append(
+                            {
+                                "id": _id,
+                                "md5": hashlib.md5(_get_random_bytes()).hexdigest(),
+                                "title": hashlib.sha256(
+                                    _get_random_bytes()
+                                ).hexdigest(),
+                                "duration": random.uniform(0, 10),
+                                "do_on": datetime.now(timezone.utc),
+                            }
+                        )
+
+                    await cur.executemany(
+                        query=f"INSERT INTO {TEST_TABLE2}(\
+                            id, \
+                            md5, \
+                            title, \
+                            duration, \
+                            do_on \
+                            ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
+                        args=_ds,
+                    )
+
+                await connect.commit()
+
+        return
 
     @pytest.mark.asyncio
-    async def test(
+    async def test_matching(
         self,
         setup_mysql_nodes,
         mmy_info,
+        mocker,
     ):
         before_reshard = await self.get_from_all_mysqls(mmy_info)
         reshard = MySQLReshard(
             mysql_info=mmy_info.mysql,
             etcd_info=mmy_info.etcd,
             insert_duplicate_behavior=MySQLInsertDuplicateBehavior.DeleteAutoIncrement,
+        )
+        mocker.patch(
+            "mmy.mysql.client.MySQLClient.consistent_hashing_select",
+            side_effect=consistent_hashing_select,
+            autospec=True,
+        )
+        mocker.patch(
+            "mmy.mysql.client.MySQLClient.consistent_hashing_delete",
+            side_effect=consistent_hashing_delete,
+            autospec=True,
+        )
+
+        def get_instance(self, data: Any):
+            return get_already_hashed_key(
+                ring=self._hr,
+                key=data,
+            )
+
+        mocker.patch(
+            "mmy.ring.Ring.get_instance",
+            side_effect=get_instance,
+            autospec=True,
         )
         # Actually do resharding
         await reshard.do(
@@ -153,21 +240,22 @@ class TestReshard:
         assert post_data_count == len(post_datas)
 
         logger.info("Matching test")
-        for index, data in enumerate(post_datas):
-            if index % 1000 == 0:
-                logger.info(f"Passed matching test: {index}/{len(post_datas)}")
+        for index, con in enumerate(mysqls):
+            logger.info(f"Matching test: {con.name} {index}/{len(mysqls)}")
+            async with aiomysql.connect(
+                host=str(con.value.host),
+                port=con.value.port,
+                cursorclass=DictCursor,
+                user=ROOT_USERINFO.user,
+                password=ROOT_USERINFO.password,
+                db=mmy_info.mysql.db,
+            ) as connect:
+                for index, data in enumerate(post_datas):
+                    if index % self.LOG_STEP == 0:
+                        logger.info(f"Passed matching test: {index}/{len(post_datas)}")
 
-            _id = data["id"]
-            instance = ring.get_instance(_id)
-            for con in mysqls:
-                async with aiomysql.connect(
-                    host=str(con.value.host),
-                    port=con.value.port,
-                    cursorclass=DictCursor,
-                    user=ROOT_USERINFO.user,
-                    password=ROOT_USERINFO.password,
-                    db=mmy_info.mysql.db,
-                ) as connect:
+                    _id = data["id"]
+                    instance = ring.get_instance(_id)
                     cur = await connect.cursor()
                     await cur.execute(
                         f"SELECT * FROM {TEST_TABLE2} WHERE id=%s", args=(_id)

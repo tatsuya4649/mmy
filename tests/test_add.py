@@ -1,8 +1,10 @@
+import bisect
 import hashlib
 import logging
 import random
 import time
 from datetime import datetime, timezone
+from pprint import pformat
 from typing import Any, Coroutine
 
 import aiomysql
@@ -11,8 +13,15 @@ import pytest_asyncio
 from aiomysql.cursors import DictCursor
 from mmy.etcd import MySQLEtcdClient
 from mmy.mysql.add import PING_RETRY_COUNT, AdderStep, MySQLAdder
-from mmy.mysql.client import MySQLClient, MySQLInsertDuplicateBehavior
+from mmy.mysql.client import (
+    CHSIter,
+    MySQLClient,
+    MySQLInsertDuplicateBehavior,
+    MySQLKeys,
+    TableName,
+)
 from mmy.mysql.errcode import MySQLErrorCode
+from mmy.mysql.sql import SQLPoint
 from mmy.parse import MmyYAML
 from mmy.ring import MovedData, MySQLRing
 from mmy.server import Server, _Server
@@ -30,6 +39,55 @@ from .test_mysql import (
 )
 
 logger = logging.getLogger(__name__)
+
+from uhashring import HashRing
+
+
+async def consistent_hashing_select(
+    self,
+    table: TableName,
+    start: SQLPoint,
+    end: SQLPoint,
+    _or: bool,
+    limit_once: int = 10000,
+):
+    keys: list[MySQLKeys] = await self.primary_keys_info(table)
+
+    return self.select(
+        table=table,
+        limit_once=limit_once,
+        iter_type=CHSIter,
+        primary_key=keys[0],
+        start=start,
+        end=end,
+        _or=_or,
+        hash_fn=None,
+    )
+
+
+_original_consistent_hashing_delete = MySQLClient.consistent_hashing_delete
+
+
+async def consistent_hashing_delete(*args, **kwargs):
+    return await _original_consistent_hashing_delete(
+        *args,
+        **kwargs,
+        hash_fn=None,
+    )
+
+
+def get_already_hashed_key(
+    ring: HashRing,
+    key: Any,
+) -> Server:
+    _keys = ring._keys
+    _key_index: int = bisect.bisect(_keys, key)
+    if _key_index == len(_keys):
+        _key_index = 0
+    _key: str = _keys[_key_index]
+    nodename: str = ring.ring[_key]
+    instance: Server = ring._nodes[nodename]["instance"]
+    return instance
 
 
 class TestAdd:
@@ -280,7 +338,7 @@ class TestAdd:
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
             for data_index, post in enumerate(init_post_data):
                 if data_index % self.LOG_STEP == 0:
-                    logger.info(f"Done: {data_index/len(init_post_data)}")
+                    logger.info(f"Done: {data_index}/{len(init_post_data)}")
 
                 key = post["id"]  # not AUTO_INCREMENT
                 nodeinfo = ring.get(key)
@@ -581,7 +639,8 @@ class TestAdd:
         mmy_info: MmyYAML,
         mocker,
     ):
-        COUNT = 1 << 12
+        INSERT_WHEN_MOVING_COUNT = 1 << 12
+        BULK_INSERT_SIZE: int = 1000
         """
 
         When DataMove step, insert data into old nodes.
@@ -589,7 +648,10 @@ class TestAdd:
         This test for checking MoveDataAgain step works correctly.
 
         """
+        from .test_ring import SAMPLE_MD5_ROWS_COUNT, sample_md5_bulk
+
         await delete_all_table(DockerMySQL.MySQL1, mmy_info)
+        logger.info("Insert test data into first MySQL node")
         async with aiomysql.connect(
             host=str(DockerMySQL.MySQL1.value.host),
             port=DockerMySQL.MySQL1.value.port,
@@ -598,12 +660,35 @@ class TestAdd:
             password=ROOT_USERINFO.password,
             db=mmy_info.mysql.db,
         ) as connect:
-            # Get all data
+
             cur = await connect.cursor()
-            await cur.execute(
-                "CALL generate_random_post(%d, %d)"
-                % (self.GENERAETE_REPEAT, self.MIN_COUNT)
-            )
+
+            def _get_random_bytes() -> bytes:
+                return str(random.uniform(0, 100)).encode("utf-8")
+
+            logger.info(f"Insert random data: {SAMPLE_MD5_ROWS_COUNT} rows")
+            for index, bulk in enumerate(sample_md5_bulk(bulk_count=BULK_INSERT_SIZE)):
+                logger.info(f"{index}: Insert size {index*BULK_INSERT_SIZE}")
+                await cur.executemany(
+                    query=f"INSERT INTO {TEST_TABLE2}(\
+                        id, \
+                        md5, \
+                        title, \
+                        duration, \
+                        do_on \
+                        ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
+                    args=[
+                        {
+                            "id": i,
+                            "md5": hashlib.md5(_get_random_bytes()).hexdigest(),
+                            "title": hashlib.sha256(_get_random_bytes()).hexdigest(),
+                            "duration": random.uniform(0, 10),
+                            "do_on": datetime.now(timezone.utc),
+                        }
+                        for i in bulk
+                    ],
+                )
+
             await connect.commit()
 
         _original = MySQLAdder.actually_move_data
@@ -613,6 +698,9 @@ class TestAdd:
         )
         cons = get_mysql_docker_for_test()
         for index, container in enumerate(cons):
+            logger.info(
+                f"Test for adding container({container.name}) {index}/{len(cons)}"
+            )
             if index > 0:
                 # Delete data inserted when startup Docker container except MySQL1
                 await delete_all_table(container, mmy_info)
@@ -638,18 +726,39 @@ class TestAdd:
                     "Insert random rows with previous hash ring without move node"
                 )
                 logger.info("it emulates inserting data while moving data to new node")
-                for i in range(COUNT):
+                insert_by_node: dict[str, list[dict[str, Any]]] = dict()
+                address_map: dict[str, Server] = dict()
+                # Create insert data
+                for i in range(INSERT_WHEN_MOVING_COUNT):
                     if i % self.LOG_STEP == 0:
-                        logger.info(f"INSERT {i}/{COUNT}")
+                        logger.info(f"INSERT {i}/{INSERT_WHEN_MOVING_COUNT}")
 
-                    _id = str(time.time_ns())
-                    _title = hashlib.sha256(_id.encode("utf-8")).hexdigest()
+                    _b = str(time.time_ns())
+                    _id = hashlib.md5(_b.encode("utf-8")).hexdigest()
+                    _title = hashlib.sha256(_b.encode("utf-8")).hexdigest()
                     _md5 = hashlib.md5(_id.encode("utf-8")).hexdigest()
                     _duration = random.uniform(0, 10)
                     _do_on = datetime.now(timezone.utc)
 
-                    _node = _ring.get_without_move(data=_id)
-                    _instance = _node["instance"]
+                    _instance: Server = get_already_hashed_key(
+                        _ring._hr_without_move, _id
+                    )
+                    address_map[_instance.address_format()] = _instance
+                    insert_by_node.setdefault(_instance.address_format(), list())
+                    insert_by_node[_instance.address_format()].append(
+                        {
+                            "id": _id,
+                            "md5": _md5,
+                            "title": _title,
+                            "duration": _duration,
+                            "do_on": _do_on,
+                        }
+                    )
+
+                _total: int = 0
+                for address_format, values in insert_by_node.items():
+                    _total += len(values)
+                    _instance = address_map[address_format]
                     # mysql random generate
                     async with aiomysql.connect(
                         host=str(_instance.host),
@@ -661,7 +770,7 @@ class TestAdd:
                     ) as connect:
                         cur = await connect.cursor()
                         async with cur:
-                            await cur.execute(
+                            await cur.executemany(
                                 query=f"INSERT INTO {TEST_TABLE2}(\
                                     id, \
                                     md5, \
@@ -669,19 +778,25 @@ class TestAdd:
                                     duration, \
                                     do_on \
                                     ) VALUES (%(id)s, %(md5)s, %(title)s, %(duration)s, %(do_on)s)",
-                                args={
-                                    "id": _id,
-                                    "md5": _md5,
-                                    "title": _title,
-                                    "duration": _duration,
-                                    "do_on": _do_on,
-                                },
+                                args=values,
                             )
                         await connect.commit()
+
+                assert _total == INSERT_WHEN_MOVING_COUNT
 
             mocker.patch(
                 "mmy.mysql.add.MySQLAdder.actually_move_data",
                 side_effect=actually_move_data,
+                autospec=True,
+            )
+            mocker.patch(
+                "mmy.mysql.client.MySQLClient.consistent_hashing_select",
+                side_effect=consistent_hashing_select,
+                autospec=True,
+            )
+            mocker.patch(
+                "mmy.mysql.client.MySQLClient.consistent_hashing_delete",
+                side_effect=consistent_hashing_delete,
                 autospec=True,
             )
 
@@ -726,13 +841,18 @@ class TestAdd:
                     password=ROOT_USERINFO.password,
                     db=mmy_info.mysql.db,
                 ) as connect:
-
+                    cur = await connect.cursor()
+                    await cur.execute(
+                        "SELECT COUNT(*) AS count FROM %s" % (TEST_TABLE2)
+                    )
                     # Get all data
                     cur = await connect.cursor()
                     await cur.execute("SELECT * FROM %s" % (TEST_TABLE2))
-                    post_data.extend(await cur.fetchall())
+                    _r = await cur.fetchall()
+                    post_data.extend(_r)
+                    logger.info(f"{_mysql.name}: {len(_r)} rows")
 
-            assert before_add_post_count + COUNT == len(post_data)
+            assert before_add_post_count + INSERT_WHEN_MOVING_COUNT == len(post_data)
 
             ring = MySQLRing(
                 mysql_info=mmy_info.mysql,
@@ -746,37 +866,52 @@ class TestAdd:
                 insert_duplicate_behavior=MySQLInsertDuplicateBehavior.Raise,
             )
             logger.info(f"Inconsistency test about init {TEST_TABLE2} data")
-            for data_index, post in enumerate(post_data):
-                if data_index % self.LOG_STEP == 0:
-                    logger.info(f"Done: {data_index}/{len(post_data)}")
+            for con in all_cluster_mysqls:
+                logger.info(f"Test {con.name}")
+                async with aiomysql.connect(
+                    host=str(con.value.host),
+                    port=con.value.port,
+                    user=ROOT_USERINFO.user,
+                    cursorclass=DictCursor,
+                    password=ROOT_USERINFO.password,
+                    db=mmy_info.mysql.db,
+                ) as connect:
+                    for data_index, post in enumerate(post_data):
+                        if data_index % self.LOG_STEP == 0:
+                            logger.info(f"Done: {data_index}/{len(post_data)}")
 
-                key = post["id"]  # not AUTO_INCREMENT
-                nodeinfo = ring.get(key)
-                instance = nodeinfo["instance"]
+                        _id: str = post["id"]  # not AUTO_INCREMENT
+                        instance = get_already_hashed_key(ring._hr, _id)
 
-                for con in all_cluster_mysqls:
-                    async with aiomysql.connect(
-                        host=str(con.value.host),
-                        port=con.value.port,
-                        user=ROOT_USERINFO.user,
-                        cursorclass=DictCursor,
-                        password=ROOT_USERINFO.password,
-                        db=mmy_info.mysql.db,
-                    ) as connect:
                         cur = await connect.cursor()
                         await cur.execute(
                             f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
                             {
-                                "_id": key,
+                                "_id": _id,
                             },
                         )
                         _f = await cur.fetchone()
                         _count = _f["count"]
 
-                        if (
-                            con.value.host == instance.host
-                            and con.value.port == instance.port
-                        ):
-                            assert _count == 1
-                        else:
-                            assert _count == 0
+                        try:
+                            if (
+                                con.value.host == instance.host
+                                and con.value.port == instance.port
+                            ):
+                                assert _count == 1
+                            else:
+                                assert _count == 0
+                        except AssertionError as e:
+                            logger.info("#################")
+                            logger.info(
+                                cur.mogrify(
+                                    f"SELECT COUNT(*) as count FROM {TEST_TABLE2} WHERE id=%(_id)s",
+                                    {
+                                        "_id": _id,
+                                    },
+                                )
+                            )
+                            logger.info(_id)
+                            logger.info(con.name)
+                            logger.info(instance)
+                            raise e

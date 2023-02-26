@@ -1,5 +1,6 @@
 import asyncio
 import ipaddress
+import logging
 from enum import Enum
 from typing import Coroutine
 
@@ -7,15 +8,9 @@ import aiomysql
 import pytest
 import pytest_asyncio
 from aiomysql.cursors import DictCursor
-from mmy.mysql.client import (
-    INSERT_ONCE_LIMIT,
-    MySQLClient,
-    MySQLClientTooManyInsertAtOnce,
-    MySQLColumns,
-    MySQLKeys,
-    TableName,
-    _Extra,
-)
+from mmy.mysql.client import (INSERT_ONCE_LIMIT, MySQLClient,
+                              MySQLClientTooManyInsertAtOnce, MySQLColumns,
+                              MySQLKeys, TableName, _Extra)
 from pymysql.err import OperationalError
 from python_on_whales import docker
 from python_on_whales.exceptions import NoSuchContainer
@@ -23,6 +18,8 @@ from rich import print
 
 from ._mysql import ROOT_USERINFO, TEST_TABLE2, _mmy_info
 from .docker import DockerStartupError, container
+
+logger = logging.getLogger(__name__)
 
 
 class DockerMySQL(Enum):
@@ -152,6 +149,7 @@ async def up_mysql_docker_containers():
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def fix_up_mysql_docker_containers():
+    logger.info("Up MySQL docker contianer")
     for mysql in get_mysql_docker_for_test():
         await up_mysql_docker_container(mysql)
 
